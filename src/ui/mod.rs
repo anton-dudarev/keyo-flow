@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eframe::egui::{self, Align, Color32, FontData, FontDefinitions, FontFamily, RichText, Theme};
 use windows_sys::Win32::UI::Controls::Dialogs::{
@@ -17,14 +17,14 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 
-use crate::core::player::PlaybackOutcome;
+use crate::core::player::{PlaybackOptions, PlaybackOutcome, PlaybackPass, RepeatMode};
 use crate::core::scenario::Scenario;
 use crate::platform::windows::{
     play_with_updates, record_with_updates, validate_playback, PlaybackUpdate, RecordingUpdate,
 };
 use crate::storage::{read_json, write_json_new};
 
-const WINDOW_SIZE: [f32; 2] = [620.0, 255.0];
+const WINDOW_SIZE: [f32; 2] = [620.0, 290.0];
 
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -77,7 +77,7 @@ enum Status {
     Opening,
     Preparing,
     Countdown(u8),
-    Playing(Instant),
+    Playing(PlaybackPass),
     Recording,
     RecordingReady,
     RecordingCancelled,
@@ -103,6 +103,35 @@ struct Job {
     recording: bool,
 }
 
+struct PlaybackSettings {
+    speed: f64,
+    count: u32,
+    infinite: bool,
+}
+
+impl Default for PlaybackSettings {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            count: 1,
+            infinite: false,
+        }
+    }
+}
+
+impl PlaybackSettings {
+    fn options(&self) -> PlaybackOptions {
+        PlaybackOptions {
+            speed: self.speed,
+            repeats: if self.infinite {
+                RepeatMode::Infinite
+            } else {
+                RepeatMode::Count(self.count)
+            },
+        }
+    }
+}
+
 impl Drop for Job {
     fn drop(&mut self) {
         if let Some(stop) = &self.stop {
@@ -119,6 +148,7 @@ struct MainWindow {
     closing: bool,
     pending_recording: Option<Arc<Scenario>>,
     record_owner: isize,
+    playback: PlaybackSettings,
 }
 
 impl MainWindow {
@@ -133,13 +163,14 @@ impl MainWindow {
     fn play(&mut self, context: &egui::Context) {
         let Some(loaded) = &self.loaded else { return };
         let scenario = Arc::clone(&loaded.scenario);
+        let options = self.playback.options();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         self.start_job(context, Some(stop), false, Status::Preparing, move |send| {
-            let result = play_with_updates((*scenario).clone(), &worker_stop, |update| {
+            let result = play_with_updates((*scenario).clone(), options, &worker_stop, |update| {
                 send(Message::Progress(match update {
                     PlaybackUpdate::Countdown(seconds) => Status::Countdown(seconds),
-                    PlaybackUpdate::Playing => Status::Playing(Instant::now()),
+                    PlaybackUpdate::Playing(pass) => Status::Playing(pass),
                 }));
             });
             send(Message::Finished(result));
@@ -420,7 +451,29 @@ impl MainWindow {
                         },
                     );
                 });
-            ui.add_space(16.0);
+            ui.add_space(12.0);
+            let can_configure = self.job.is_none() && self.pending_recording.is_none();
+            ui.add_enabled_ui(can_configure, |ui| {
+                ui.horizontal(|ui| {
+                    let speed_label = ui.label("Скорость");
+                    ui.add(
+                        egui::DragValue::new(&mut self.playback.speed)
+                            .range(0.25..=4.0)
+                            .speed(0.05)
+                            .max_decimals(2)
+                            .suffix("×"),
+                    )
+                    .labelled_by(speed_label.id);
+                    let count_label = ui.label("Запуски");
+                    ui.add_enabled(
+                        !self.playback.infinite,
+                        egui::DragValue::new(&mut self.playback.count).range(1..=u32::MAX),
+                    )
+                    .labelled_by(count_label.id);
+                    ui.checkbox(&mut self.playback.infinite, "Повторять бесконечно");
+                });
+            });
+            ui.add_space(12.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), 44.0),
                 egui::Layout::right_to_left(Align::Center),
@@ -533,7 +586,10 @@ impl MainWindow {
                 format!("Запись через {seconds} с")
             }
             Status::Countdown(seconds) => format!("Запуск через {seconds} с"),
-            Status::Playing(_) => "Идёт воспроизведение".into(),
+            Status::Playing(pass) if self.playback.infinite => {
+                format!("Запуск {} · без лимита", pass.number)
+            }
+            Status::Playing(pass) => format!("Запуск {} из {}", pass.number, self.playback.count),
             Status::Recording => "Идёт запись".into(),
             Status::RecordingReady => "Запись завершена".into(),
             Status::RecordingCancelled => "Запись отменена до запуска".into(),
@@ -550,13 +606,23 @@ impl MainWindow {
     fn progress(&self, context: &egui::Context) -> Option<f32> {
         match self.status {
             Status::Countdown(seconds) => Some(f32::from(3 - seconds) / 3.0),
-            Status::Playing(start) => {
+            Status::Playing(pass) => {
                 let duration = self.loaded.as_ref()?.duration;
                 if duration.is_zero() {
                     return None;
                 }
                 context.request_repaint_after(Duration::from_millis(80));
-                Some((start.elapsed().as_secs_f32() / duration.as_secs_f32()).min(0.99))
+                let fraction = (pass.started_at.elapsed().as_secs_f64() * self.playback.speed
+                    / duration.as_secs_f64())
+                .min(0.99);
+                if self.playback.infinite {
+                    Some(fraction as f32)
+                } else {
+                    Some(
+                        ((pass.number.saturating_sub(1) as f64 + fraction)
+                            / f64::from(self.playback.count)) as f32,
+                    )
+                }
             }
             _ => None,
         }
@@ -664,6 +730,20 @@ fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unlimited_mode_keeps_the_count_for_the_next_finite_run() {
+        let mut settings = PlaybackSettings {
+            speed: 1.5,
+            count: 3,
+            infinite: true,
+        };
+        let options = settings.options();
+        assert_eq!(options.repeats, RepeatMode::Infinite);
+        assert_eq!(options.speed, 1.5);
+        settings.infinite = false;
+        assert_eq!(settings.options().repeats, RepeatMode::Count(3));
+    }
 
     #[test]
     fn recording_survives_cancelled_save_and_becomes_ready_after_retry() {
@@ -796,7 +876,10 @@ mod tests {
         window.stop();
         assert!(stop.load(Ordering::Relaxed));
         sender
-            .send(Message::Progress(Status::Playing(Instant::now())))
+            .send(Message::Progress(Status::Playing(PlaybackPass {
+                number: 1,
+                started_at: std::time::Instant::now(),
+            })))
             .unwrap();
         window.poll_messages();
         assert!(matches!(window.status, Status::Stopping));

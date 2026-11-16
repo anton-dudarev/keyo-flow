@@ -18,7 +18,7 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::core::player::{self, PlaybackOutcome};
+use crate::core::player::{self, PlaybackOptions, PlaybackOutcome, PlaybackPass};
 use crate::core::scenario::{Event, MouseButton, Scenario};
 
 mod capture;
@@ -29,7 +29,7 @@ static ACTIVE: Mutex<()> = Mutex::new(());
 
 pub enum PlaybackUpdate {
     Countdown(u8),
-    Playing,
+    Playing(PlaybackPass),
 }
 
 pub fn play(scenario: Scenario, dry_run: bool) -> io::Result<()> {
@@ -44,13 +44,18 @@ pub fn play(scenario: Scenario, dry_run: bool) -> io::Result<()> {
     }
 
     let mut playing = false;
-    let outcome = play_with_updates(scenario, &AtomicBool::new(false), |update| match update {
-        PlaybackUpdate::Countdown(3) => {
-            println!("Запуск через 3 секунды. Переключись в тестовое окно. Остановка: Esc.");
-        }
-        PlaybackUpdate::Countdown(_) => {}
-        PlaybackUpdate::Playing => playing = true,
-    })?;
+    let outcome = play_with_updates(
+        scenario,
+        PlaybackOptions::default(),
+        &AtomicBool::new(false),
+        |update| match update {
+            PlaybackUpdate::Countdown(3) => {
+                println!("Запуск через 3 секунды. Переключись в тестовое окно. Остановка: Esc.");
+            }
+            PlaybackUpdate::Countdown(_) => {}
+            PlaybackUpdate::Playing(_) => playing = true,
+        },
+    )?;
     match outcome {
         PlaybackOutcome::Completed => println!("Воспроизведение завершено."),
         PlaybackOutcome::Stopped if !playing => println!("Воспроизведение отменено до запуска."),
@@ -65,9 +70,11 @@ pub fn validate_playback(scenario: &Scenario) -> io::Result<()> {
 
 pub fn play_with_updates(
     scenario: Scenario,
+    options: PlaybackOptions,
     cancelled: &AtomicBool,
     mut report: impl FnMut(PlaybackUpdate),
 ) -> io::Result<PlaybackOutcome> {
+    options.validate(&scenario)?;
     let _active = ACTIVE
         .try_lock()
         .map_err(|_| io::Error::other("Адаптер Windows уже занят или завершился с ошибкой"))?;
@@ -87,17 +94,23 @@ pub fn play_with_updates(
     }) {
         return Ok(PlaybackOutcome::Stopped);
     }
-    report(PlaybackUpdate::Playing);
     if stop() {
         return Ok(PlaybackOutcome::Stopped);
     }
 
-    let playback = player::play(scenario, 1.0, 1, move |event| {
+    let playback = player::play_with_options(scenario, options, move |event| {
         desktop.convert(event)?.send()
     })?;
+    let mut last_reported = 0;
     loop {
         if stop() {
             playback.stop();
+        }
+        if let Some(pass) = playback.current_pass() {
+            if pass.number != last_reported {
+                last_reported = pass.number;
+                report(PlaybackUpdate::Playing(pass));
+            }
         }
         match playback.result.try_recv() {
             Ok(result) => return result,

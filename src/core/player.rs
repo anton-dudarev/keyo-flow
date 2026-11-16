@@ -1,6 +1,6 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
@@ -13,14 +13,70 @@ pub enum PlaybackOutcome {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatMode {
+    Count(u32),
+    Infinite,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PlaybackOptions {
+    pub speed: f64,
+    pub repeats: RepeatMode,
+}
+
+impl Default for PlaybackOptions {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            repeats: RepeatMode::Count(1),
+        }
+    }
+}
+
+impl PlaybackOptions {
+    pub(crate) fn validate(self, scenario: &Scenario) -> io::Result<()> {
+        if !self.speed.is_finite() || self.speed <= 0.0 || self.repeats == RepeatMode::Count(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Требуются положительная конечная скорость и хотя бы один запуск",
+            ));
+        }
+        if self.repeats == RepeatMode::Infinite && scenario.events.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Пустой сценарий нельзя повторять бесконечно",
+            ));
+        }
+        let total = scenario
+            .events
+            .iter()
+            .map(|event| u128::from(event.delay_micros))
+            .sum();
+        target_time(Instant::now(), total, self.speed)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PlaybackPass {
+    pub number: u64,
+    pub started_at: Instant,
+}
+
 pub struct Playback {
     /// Итог можно опрашивать через `try_recv` из потока интерфейса.
     pub result: mpsc::Receiver<io::Result<PlaybackOutcome>>,
     stopped: Arc<AtomicBool>,
     worker: Thread,
+    pass: Arc<Mutex<Option<PlaybackPass>>>,
 }
 
 impl Playback {
+    pub fn current_pass(&self) -> Option<PlaybackPass> {
+        *self.pass.lock().unwrap()
+    }
+
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
         self.worker.unpark();
@@ -42,49 +98,68 @@ pub fn play(
     scenario: Scenario,
     speed: f64,
     repeats: u32,
+    send: impl FnMut(&Event) -> io::Result<()> + Send + 'static,
+) -> io::Result<Playback> {
+    play_with_options(
+        scenario,
+        PlaybackOptions {
+            speed,
+            repeats: RepeatMode::Count(repeats),
+        },
+        send,
+    )
+}
+
+pub fn play_with_options(
+    scenario: Scenario,
+    options: PlaybackOptions,
     mut send: impl FnMut(&Event) -> io::Result<()> + Send + 'static,
 ) -> io::Result<Playback> {
-    if !speed.is_finite() || speed <= 0.0 || repeats == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Требуются положительная конечная скорость и хотя бы один повтор",
-        ));
-    }
+    options.validate(&scenario)?;
 
     let (sender, result) = mpsc::channel();
     let stopped = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stopped);
+    let pass = Arc::new(Mutex::new(None));
+    let worker_pass = Arc::clone(&pass);
     let worker = thread::Builder::new()
         .name("keyo-playback".into())
         .spawn(move || {
-            let outcome = run(&scenario, speed, repeats, &worker_stop, &mut send);
+            let outcome = run(&scenario, options, &worker_stop, &worker_pass, &mut send);
             let _ = sender.send(outcome);
         })?;
     Ok(Playback {
         result,
         stopped,
         worker: worker.thread().clone(),
+        pass,
     })
 }
 
 fn run(
     scenario: &Scenario,
-    speed: f64,
-    repeats: u32,
+    options: PlaybackOptions,
     stopped: &AtomicBool,
+    pass: &Mutex<Option<PlaybackPass>>,
     send: &mut impl FnMut(&Event) -> io::Result<()>,
 ) -> io::Result<PlaybackOutcome> {
     if scenario.events.is_empty() {
         return Ok(PlaybackOutcome::Completed);
     }
 
-    for _ in 0..repeats {
+    let mut number = 0_u64;
+    while !stopped.load(Ordering::Relaxed) {
+        number = number.saturating_add(1);
         let start = Instant::now();
+        *pass.lock().unwrap() = Some(PlaybackPass {
+            number,
+            started_at: start,
+        });
         let mut elapsed_micros = 0;
         let mut input = PressedInputGuard::new(send);
         for timed in &scenario.events {
             elapsed_micros += u128::from(timed.delay_micros);
-            let deadline = target_time(start, elapsed_micros, speed)?;
+            let deadline = target_time(start, elapsed_micros, options.speed)?;
             if !wait_until(deadline, stopped) {
                 input.release_all()?;
                 return Ok(PlaybackOutcome::Stopped);
@@ -92,8 +167,14 @@ fn run(
             input.send(&timed.event)?;
         }
         input.release_all()?;
+        if matches!(options.repeats, RepeatMode::Count(count) if number == u64::from(count)) {
+            return Ok(PlaybackOutcome::Completed);
+        }
+        if elapsed_micros == 0 && options.repeats == RepeatMode::Infinite {
+            thread::yield_now();
+        }
     }
-    Ok(PlaybackOutcome::Completed)
+    Ok(PlaybackOutcome::Stopped)
 }
 
 fn target_time(start: Instant, elapsed_micros: u128, speed: f64) -> io::Result<Instant> {
@@ -122,6 +203,89 @@ fn wait_until(deadline: Instant, stopped: &AtomicBool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::scenario::TimedEvent;
+
+    #[test]
+    fn infinite_playback_can_stop_in_the_middle_of_a_delay() {
+        let key = String::from("KeyA");
+        let down = Event::KeyDown { key: key.clone() };
+        let (sender, receiver) = mpsc::channel();
+        let playback = play_with_options(
+            Scenario {
+                events: vec![
+                    TimedEvent {
+                        delay_micros: 0,
+                        event: down.clone(),
+                    },
+                    TimedEvent {
+                        delay_micros: 60_000_000,
+                        event: Event::Scroll { x: 0, y: 1 },
+                    },
+                ],
+            },
+            PlaybackOptions {
+                speed: 2.0,
+                repeats: RepeatMode::Infinite,
+            },
+            move |event| {
+                sender.send(event.clone()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let timeout = Duration::from_secs(3);
+        assert_eq!(receiver.recv_timeout(timeout).unwrap(), down);
+        playback.stop();
+        assert_eq!(
+            playback.result.recv_timeout(timeout).unwrap().unwrap(),
+            PlaybackOutcome::Stopped
+        );
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<_>>(),
+            [Event::KeyUp { key }]
+        );
+    }
+
+    #[test]
+    fn infinite_mode_runs_multiple_passes_and_rejects_empty_scenarios() {
+        let options = PlaybackOptions {
+            speed: 1.0,
+            repeats: RepeatMode::Infinite,
+        };
+        assert_eq!(
+            play_with_options(Scenario { events: vec![] }, options, |_| unreachable!())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let event = Event::Scroll { x: 0, y: 1 };
+        let (sender, receiver) = mpsc::channel();
+        let playback = play_with_options(
+            Scenario {
+                events: vec![TimedEvent {
+                    delay_micros: 5_000,
+                    event: event.clone(),
+                }],
+            },
+            options,
+            move |event| {
+                let _ = sender.send(event.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let timeout = Duration::from_secs(3);
+        for _ in 0..3 {
+            assert_eq!(receiver.recv_timeout(timeout).unwrap(), event);
+        }
+        playback.stop();
+        assert_eq!(
+            playback.result.recv_timeout(timeout).unwrap().unwrap(),
+            PlaybackOutcome::Stopped
+        );
+        assert!(playback.current_pass().unwrap().number >= 3);
+    }
 
     #[test]
     fn scales_cumulative_deadlines_from_the_start_of_the_repeat() {
