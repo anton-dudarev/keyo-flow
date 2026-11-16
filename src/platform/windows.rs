@@ -19,6 +19,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::core::player::{self, PlaybackOutcome};
 use crate::core::scenario::{Event, MouseButton, Scenario};
 
+mod capture;
+pub use capture::record;
+
 static STOPPED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: Mutex<()> = Mutex::new(());
 
@@ -39,16 +42,9 @@ pub fn play(scenario: Scenario, dry_run: bool) -> io::Result<()> {
 
     let _stop = StopHook::install()?;
     println!("Запуск через 3 секунды. Переключись в тестовое окно. Остановка: Esc.");
-    let ready = Instant::now() + Duration::from_secs(3);
-    loop {
-        if stop_requested() {
-            println!("Воспроизведение отменено до запуска.");
-            return Ok(());
-        }
-        if Instant::now() >= ready {
-            break;
-        }
-        wait_for_messages();
+    if !countdown() {
+        println!("Воспроизведение отменено до запуска.");
+        return Ok(());
     }
 
     let playback = player::play(scenario, 1.0, 1, move |event| {
@@ -74,6 +70,17 @@ pub fn play(scenario: Scenario, dry_run: bool) -> io::Result<()> {
             }
         }
     }
+}
+
+fn countdown() -> bool {
+    let ready = Instant::now() + Duration::from_secs(3);
+    while !stop_requested() {
+        if Instant::now() >= ready {
+            return true;
+        }
+        wait_for_messages();
+    }
+    false
 }
 
 fn validate(scenario: &Scenario, desktop: Desktop) -> io::Result<()> {
@@ -195,36 +202,40 @@ fn wheel_data(notches: i64) -> io::Result<u32> {
         .ok_or_else(|| invalid("Величина прокрутки выходит за диапазон Windows"))
 }
 
+const NAMED_KEYS: &[(&str, u16)] = &[
+    ("Space", VK_SPACE),
+    ("Enter", VK_RETURN),
+    ("Tab", VK_TAB),
+    ("Escape", VK_ESCAPE),
+    ("Backspace", VK_BACK),
+    ("ControlLeft", VK_LCONTROL),
+    ("ControlRight", VK_RCONTROL),
+    ("ShiftLeft", VK_LSHIFT),
+    ("ShiftRight", VK_RSHIFT),
+    ("AltLeft", VK_LMENU),
+    ("AltRight", VK_RMENU),
+    ("MetaLeft", VK_LWIN),
+    ("MetaRight", VK_RWIN),
+    ("ArrowLeft", VK_LEFT),
+    ("ArrowRight", VK_RIGHT),
+    ("ArrowUp", VK_UP),
+    ("ArrowDown", VK_DOWN),
+    ("Home", VK_HOME),
+    ("End", VK_END),
+    ("PageUp", VK_PRIOR),
+    ("PageDown", VK_NEXT),
+    ("Insert", VK_INSERT),
+    ("Delete", VK_DELETE),
+];
+
 fn keyboard_code(key: &str) -> io::Result<(u16, u32)> {
     let code = match key.as_bytes() {
         [b'K', b'e', b'y', letter @ b'A'..=b'Z'] => u16::from(*letter),
         [b'D', b'i', b'g', b'i', b't', digit @ b'0'..=b'9'] => u16::from(*digit),
-        _ => match key {
-            "Space" => VK_SPACE,
-            "Enter" => VK_RETURN,
-            "Tab" => VK_TAB,
-            "Escape" => VK_ESCAPE,
-            "Backspace" => VK_BACK,
-            "ControlLeft" => VK_LCONTROL,
-            "ControlRight" => VK_RCONTROL,
-            "ShiftLeft" => VK_LSHIFT,
-            "ShiftRight" => VK_RSHIFT,
-            "AltLeft" => VK_LMENU,
-            "AltRight" => VK_RMENU,
-            "MetaLeft" => VK_LWIN,
-            "MetaRight" => VK_RWIN,
-            "ArrowLeft" => VK_LEFT,
-            "ArrowRight" => VK_RIGHT,
-            "ArrowUp" => VK_UP,
-            "ArrowDown" => VK_DOWN,
-            "Home" => VK_HOME,
-            "End" => VK_END,
-            "PageUp" => VK_PRIOR,
-            "PageDown" => VK_NEXT,
-            "Insert" => VK_INSERT,
-            "Delete" => VK_DELETE,
-            _ => return Err(invalid("Неподдерживаемый идентификатор клавиши")),
-        },
+        _ => NAMED_KEYS
+            .iter()
+            .find_map(|&(name, code)| (name == key).then_some(code))
+            .ok_or_else(|| invalid("Неподдерживаемый идентификатор клавиши"))?,
     };
     let extended = matches!(
         code,
@@ -321,11 +332,17 @@ impl Drop for StopHook {
 }
 
 unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && matches!(message as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+    if code == HC_ACTION as i32 {
         // SAFETY: для HC_ACTION Windows передаёт указатель на KBDLLHOOKSTRUCT.
         let event = unsafe { &*(data as *const KBDLLHOOKSTRUCT) };
-        if event.vkCode == u32::from(VK_ESCAPE) && event.flags & LLKHF_INJECTED == 0 {
-            STOPPED.store(true, Ordering::Relaxed);
+        if capture::is_physical_keyboard(event.flags) {
+            if event.vkCode == u32::from(VK_ESCAPE) {
+                if matches!(message as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                    STOPPED.store(true, Ordering::Relaxed);
+                }
+            } else {
+                capture::keyboard(message as u32, *event);
+            }
         }
     }
     // SAFETY: исходные параметры передаются следующему хуку без изменений.

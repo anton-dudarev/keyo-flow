@@ -2,6 +2,85 @@ use crate::core::scenario::{Event, MouseButton, Scenario, TimedEvent};
 use crate::storage::{read_json, write_json};
 
 #[test]
+fn recorded_scenario_round_trips_without_overwriting_existing_file() {
+    use crate::storage::write_json_new;
+    use std::{fs, io};
+
+    let path = std::env::temp_dir().join(format!("keyo-record-{}.json", std::process::id()));
+    let scenario = Scenario {
+        events: vec![TimedEvent {
+            delay_micros: 5_000,
+            event: Event::MouseMove { x: -90, y: 5 },
+        }],
+    };
+    write_json_new(&path, &scenario).unwrap();
+    let replacement = write_json_new(&path, &Scenario { events: vec![] });
+    let contents = fs::read(&path);
+    fs::remove_file(&path).unwrap();
+
+    assert_eq!(
+        replacement.unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(read_json(contents.unwrap().as_slice()).unwrap(), scenario);
+}
+
+#[test]
+fn recorder_preserves_click_position_and_relative_delays() {
+    use crate::core::recorder::Recorder;
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let at = |millis| start + Duration::from_millis(millis);
+    let mut recorder = Recorder::new(start);
+    recorder.push(at(2), Event::MouseMove { x: -90, y: 5 });
+    recorder.push(at(4), Event::MouseMove { x: -70, y: 5 });
+    recorder.push(at(6), Event::MouseMove { x: -50, y: 5 });
+    recorder.push_mouse_action(
+        at(7),
+        (-40, 5),
+        Event::MouseDown {
+            button: MouseButton::Left,
+        },
+    );
+    recorder.push_mouse_action(
+        at(11),
+        (-40, 5),
+        Event::MouseUp {
+            button: MouseButton::Left,
+        },
+    );
+    recorder.push(at(17), Event::MouseMove { x: -20, y: 5 });
+    recorder.push(at(18), Event::MouseMove { x: -10, y: 5 });
+
+    let events = recorder.finish().events;
+    assert_eq!(
+        events
+            .into_iter()
+            .map(|timed| (timed.delay_micros, timed.event))
+            .collect::<Vec<_>>(),
+        [
+            (2_000, Event::MouseMove { x: -90, y: 5 }),
+            (5_000, Event::MouseMove { x: -40, y: 5 }),
+            (
+                0,
+                Event::MouseDown {
+                    button: MouseButton::Left
+                }
+            ),
+            (
+                4_000,
+                Event::MouseUp {
+                    button: MouseButton::Left
+                }
+            ),
+            (6_000, Event::MouseMove { x: -20, y: 5 }),
+            (1_000, Event::MouseMove { x: -10, y: 5 }),
+        ]
+    );
+}
+
+#[test]
 fn json_preserves_all_event_kinds_in_order() {
     let scenario = Scenario {
         events: [

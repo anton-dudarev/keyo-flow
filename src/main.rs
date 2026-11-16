@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use keyo_flow::core::scenario::Scenario;
 use keyo_flow::storage::read_json;
 
-const USAGE: &str = "Использование: keyo play <файл.json> [--dry-run]";
+const USAGE: &str =
+    "Использование:\n  keyo play <файл.json> [--dry-run]\n  keyo record <файл.json>";
 
 fn main() -> ExitCode {
     match run() {
@@ -31,23 +32,57 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let path = args.next();
     let option = args.next();
-    if command.as_deref().and_then(|arg| arg.to_str()) != Some("play")
-        || path.is_none()
-        || option.as_ref().is_some_and(|arg| arg != "--dry-run")
-        || args.len() != 0
-    {
+    let Some(path) = path else {
+        return Err(USAGE.into());
+    };
+    if args.len() != 0 {
         return Err(USAGE.into());
     }
-    let path = path.unwrap();
-    let reader = BufReader::new(File::open(&path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("Не удалось открыть {:?}: {error}", path),
-        )
-    })?);
-    let scenario = read_json(reader)?;
-    play(scenario, option.is_some())?;
+    match command.as_deref().and_then(|arg| arg.to_str()) {
+        Some("play") if option.as_ref().is_none_or(|arg| arg == "--dry-run") => {
+            let reader = BufReader::new(File::open(&path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("Не удалось открыть {path:?}: {error}"),
+                )
+            })?);
+            play(read_json(reader)?, option.is_some())?;
+        }
+        Some("record") if option.is_none() => record(path.as_ref())?,
+        _ => return Err(USAGE.into()),
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn record(path: &std::path::Path) -> io::Result<()> {
+    if path.try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("Файл {path:?} уже существует. Укажи новый путь."),
+        ));
+    }
+    if let Some(scenario) = keyo_flow::platform::windows::record()? {
+        keyo_flow::storage::write_json_new(path, &scenario).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Не удалось сохранить {path:?}: {error}"),
+            )
+        })?;
+        println!(
+            "Сценарий сохранён в {path:?}. Событий: {}.",
+            scenario.events.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn record(_: &std::path::Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Команда record доступна только в Windows",
+    ))
 }
 
 #[cfg(windows)]

@@ -1,4 +1,6 @@
-use std::io::{Read, Write};
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Read, Write};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -45,4 +47,17 @@ pub fn write_json(writer: impl Write, scenario: &Scenario) -> serde_json::Result
             events: &scenario.events,
         },
     )
+}
+
+/// Сохраняет сценарий в новый файл и сообщает об ошибке, если путь уже занят.
+pub fn write_json_new(path: &Path, scenario: &Scenario) -> io::Result<()> {
+    let mut writer = BufWriter::new(File::create_new(path)?);
+    let result = write_json(&mut writer, scenario)
+        .map_err(io::Error::from)
+        .and_then(|()| writer.flush());
+    drop(writer);
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
 }
