@@ -4,7 +4,7 @@ use std::sync::{mpsc, Arc};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
-use super::safety::ModifierGuard;
+use super::safety::PressedInputGuard;
 use super::scenario::{Event, Scenario};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,17 +81,17 @@ fn run(
     for _ in 0..repeats {
         let start = Instant::now();
         let mut elapsed_micros = 0;
-        let mut input = ModifierGuard::new(send);
+        let mut input = PressedInputGuard::new(send);
         for timed in &scenario.events {
             elapsed_micros += u128::from(timed.delay_micros);
             let deadline = target_time(start, elapsed_micros, speed)?;
             if !wait_until(deadline, stopped) {
-                input.release_all_modifiers()?;
+                input.release_all()?;
                 return Ok(PlaybackOutcome::Stopped);
             }
             input.send(&timed.event)?;
         }
-        input.release_all_modifiers()?;
+        input.release_all()?;
     }
     Ok(PlaybackOutcome::Completed)
 }

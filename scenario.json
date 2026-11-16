@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "events": [
+    {
+      "delay_micros": 5000000,
+      "event": { "type": "key_down", "key": "KeyA" }
+    },
+    {
+      "delay_micros": 50000,
+      "event": { "type": "key_up", "key": "KeyA" }
+    }
+  ]
+}

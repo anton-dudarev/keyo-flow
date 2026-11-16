@@ -120,6 +120,40 @@ mod playback {
     }
 
     #[test]
+    fn stop_releases_held_key_and_mouse_button_in_reverse_order() {
+        let key = String::from("KeyA");
+        let button = MouseButton::Left;
+        let down = Event::KeyDown { key: key.clone() };
+        let mouse_down = Event::MouseDown { button };
+        let (sent, received) = mpsc::channel();
+        let player = play(
+            scenario(&[
+                (0, down.clone()),
+                (0, mouse_down.clone()),
+                (60_000_000, Event::Scroll { x: 0, y: 1 }),
+            ]),
+            1.0,
+            1,
+            move |event| {
+                sent.send(event.clone()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(received.recv_timeout(TIMEOUT).unwrap(), down);
+        assert_eq!(received.recv_timeout(TIMEOUT).unwrap(), mouse_down);
+        player.stop();
+        assert_eq!(
+            player.result.recv_timeout(TIMEOUT).unwrap().unwrap(),
+            PlaybackOutcome::Stopped
+        );
+        assert_eq!(
+            received.try_iter().collect::<Vec<_>>(),
+            [Event::MouseUp { button }, Event::KeyUp { key }]
+        );
+    }
+
+    #[test]
     fn send_error_releases_modifier_before_reporting() {
         let key = String::from("ShiftRight");
         let down = Event::KeyDown { key: key.clone() };
