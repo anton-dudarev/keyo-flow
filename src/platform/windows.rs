@@ -7,7 +7,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
+use windows_sys::Win32::System::Console::{
+    GetConsoleWindow, SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
     AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
@@ -25,43 +27,80 @@ pub use capture::record;
 static STOPPED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: Mutex<()> = Mutex::new(());
 
+pub enum PlaybackUpdate {
+    Countdown(u8),
+    Playing,
+}
+
 pub fn play(scenario: Scenario, dry_run: bool) -> io::Result<()> {
+    if dry_run || scenario.events.is_empty() {
+        validate_playback(&scenario)?;
+        if dry_run {
+            println!("Сценарий проверен. Событий: {}.", scenario.events.len());
+        } else {
+            println!("В сценарии нет событий.");
+        }
+        return Ok(());
+    }
+
+    let mut playing = false;
+    let outcome = play_with_updates(scenario, &AtomicBool::new(false), |update| match update {
+        PlaybackUpdate::Countdown(3) => {
+            println!("Запуск через 3 секунды. Переключись в тестовое окно. Остановка: Esc.");
+        }
+        PlaybackUpdate::Countdown(_) => {}
+        PlaybackUpdate::Playing => playing = true,
+    })?;
+    match outcome {
+        PlaybackOutcome::Completed => println!("Воспроизведение завершено."),
+        PlaybackOutcome::Stopped if !playing => println!("Воспроизведение отменено до запуска."),
+        PlaybackOutcome::Stopped => println!("Воспроизведение остановлено."),
+    }
+    Ok(())
+}
+
+pub fn validate_playback(scenario: &Scenario) -> io::Result<()> {
+    validate(scenario, Desktop::current()?)
+}
+
+pub fn play_with_updates(
+    scenario: Scenario,
+    cancelled: &AtomicBool,
+    mut report: impl FnMut(PlaybackUpdate),
+) -> io::Result<PlaybackOutcome> {
     let _active = ACTIVE
         .try_lock()
         .map_err(|_| io::Error::other("Адаптер Windows уже занят или завершился с ошибкой"))?;
     let desktop = Desktop::current()?;
     validate(&scenario, desktop)?;
-    if dry_run {
-        println!("Сценарий проверен. Событий: {}.", scenario.events.len());
-        return Ok(());
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(PlaybackOutcome::Stopped);
     }
     if scenario.events.is_empty() {
-        println!("В сценарии нет событий.");
-        return Ok(());
+        return Ok(PlaybackOutcome::Completed);
     }
 
     let _stop = StopHook::install()?;
-    println!("Запуск через 3 секунды. Переключись в тестовое окно. Остановка: Esc.");
-    if !countdown() {
-        println!("Воспроизведение отменено до запуска.");
-        return Ok(());
+    let stop = || cancelled.load(Ordering::Relaxed) || stop_requested();
+    if !countdown_with(stop, wait_for_messages, |seconds| {
+        report(PlaybackUpdate::Countdown(seconds));
+    }) {
+        return Ok(PlaybackOutcome::Stopped);
+    }
+    report(PlaybackUpdate::Playing);
+    if stop() {
+        return Ok(PlaybackOutcome::Stopped);
     }
 
     let playback = player::play(scenario, 1.0, 1, move |event| {
         desktop.convert(event)?.send()
     })?;
     loop {
-        if stop_requested() {
+        if stop() {
             playback.stop();
         }
         match playback.result.try_recv() {
-            Ok(result) => {
-                match result? {
-                    PlaybackOutcome::Completed => println!("Воспроизведение завершено."),
-                    PlaybackOutcome::Stopped => println!("Воспроизведение остановлено."),
-                }
-                return Ok(());
-            }
+            Ok(result) => return result,
             Err(TryRecvError::Empty) => wait_for_messages(),
             Err(TryRecvError::Disconnected) => {
                 return Err(io::Error::other(
@@ -73,14 +112,42 @@ pub fn play(scenario: Scenario, dry_run: bool) -> io::Result<()> {
 }
 
 fn countdown() -> bool {
+    countdown_with(stop_requested, wait_for_messages, |_| {})
+}
+
+fn countdown_with(
+    mut cancelled: impl FnMut() -> bool,
+    mut wait: impl FnMut(),
+    mut report: impl FnMut(u8),
+) -> bool {
     let ready = Instant::now() + Duration::from_secs(3);
-    while !stop_requested() {
-        if Instant::now() >= ready {
+    let mut previous = 0;
+    while !cancelled() {
+        let remaining = ready.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return true;
         }
-        wait_for_messages();
+        let seconds = remaining.as_nanos().div_ceil(1_000_000_000) as u8;
+        if seconds != previous {
+            previous = seconds;
+            report(seconds);
+        }
+        wait();
     }
     false
+}
+
+pub fn enable_dpi_awareness() -> io::Result<()> {
+    // SAFETY: функции работают с контекстом текущего процесса или потока.
+    unsafe {
+        let context = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
+        if AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), context) == 0
+            && SetProcessDpiAwarenessContext(context) == 0
+        {
+            return Err(os_error("Не удалось настроить DPI для физического ввода"));
+        }
+    }
+    Ok(())
 }
 
 fn validate(scenario: &Scenario, desktop: Desktop) -> io::Result<()> {
@@ -110,14 +177,9 @@ struct Desktop {
 
 impl Desktop {
     fn current() -> io::Result<Self> {
-        // SAFETY: функции работают с контекстом текущего процесса или потока.
+        enable_dpi_awareness()?;
+        // SAFETY: читаем параметры виртуального экрана текущего сеанса.
         unsafe {
-            let context = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
-            if AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), context) == 0
-                && SetProcessDpiAwarenessContext(context) == 0
-            {
-                return Err(os_error("Не удалось настроить DPI для физического ввода"));
-            }
             Ok(Self {
                 x: GetSystemMetrics(SM_XVIRTUALSCREEN),
                 y: GetSystemMetrics(SM_YVIRTUALSCREEN),
@@ -299,7 +361,10 @@ impl Inputs {
     }
 }
 
-struct StopHook(HHOOK);
+struct StopHook {
+    handle: HHOOK,
+    console: bool,
+}
 
 impl StopHook {
     fn install() -> io::Result<Self> {
@@ -311,12 +376,13 @@ impl StopHook {
             if handle.is_null() {
                 return Err(os_error("Не удалось подключить аварийную клавишу Esc"));
             }
-            if SetConsoleCtrlHandler(Some(console_handler), 1) == 0 {
+            let console = !GetConsoleWindow().is_null();
+            if console && SetConsoleCtrlHandler(Some(console_handler), 1) == 0 {
                 let error = os_error("Не удалось подключить обработчик Ctrl+C");
                 UnhookWindowsHookEx(handle);
                 return Err(error);
             }
-            Ok(Self(handle))
+            Ok(Self { handle, console })
         }
     }
 }
@@ -325,8 +391,10 @@ impl Drop for StopHook {
     fn drop(&mut self) {
         // SAFETY: снимаем именно те обработчики, которые установили.
         unsafe {
-            UnhookWindowsHookEx(self.0);
-            SetConsoleCtrlHandler(Some(console_handler), 0);
+            UnhookWindowsHookEx(self.handle);
+            if self.console {
+                SetConsoleCtrlHandler(Some(console_handler), 0);
+            }
         }
     }
 }
@@ -387,6 +455,19 @@ fn os_error(message: &str) -> io::Error {
 mod tests {
     use super::*;
     use crate::core::scenario::TimedEvent;
+
+    #[test]
+    fn cancellation_during_countdown_prevents_playback() {
+        let cancelled = std::cell::Cell::new(false);
+        let mut reported = Vec::new();
+        let go = countdown_with(
+            || cancelled.get(),
+            || cancelled.set(true),
+            |seconds| reported.push(seconds),
+        );
+        assert!(!go);
+        assert_eq!(reported, [3]);
+    }
 
     const DESKTOP: Desktop = Desktop {
         x: -1920,
