@@ -22,7 +22,7 @@ use crate::core::player::{self, PlaybackOutcome};
 use crate::core::scenario::{Event, MouseButton, Scenario};
 
 mod capture;
-pub use capture::record;
+pub use capture::{record, record_with_updates, RecordingUpdate};
 
 static STOPPED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: Mutex<()> = Mutex::new(());
@@ -109,10 +109,6 @@ pub fn play_with_updates(
             }
         }
     }
-}
-
-fn countdown() -> bool {
-    countdown_with(stop_requested, wait_for_messages, |_| {})
 }
 
 fn countdown_with(

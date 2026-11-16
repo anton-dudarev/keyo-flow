@@ -17,20 +17,60 @@ enum Packet {
 }
 
 pub fn record() -> io::Result<Option<Scenario>> {
+    let scenario = record_with_updates(&AtomicBool::new(false), |update| match update {
+        RecordingUpdate::Countdown(3) => {
+            println!(
+                "Запись начнётся через 3 секунды. Переключись в тестовое окно. Остановка: Esc."
+            );
+        }
+        RecordingUpdate::Countdown(_) => {}
+        RecordingUpdate::Recording => println!("Запись началась. Нажми Esc, чтобы завершить."),
+    })?;
+    if scenario.is_none() {
+        println!("Запись отменена до запуска.");
+    }
+    Ok(scenario)
+}
+
+pub enum RecordingUpdate {
+    Countdown(u8),
+    Recording,
+}
+
+pub fn record_with_updates(
+    cancelled: &AtomicBool,
+    mut report: impl FnMut(RecordingUpdate) + Send,
+) -> io::Result<Option<Scenario>> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     let _active = ACTIVE
         .try_lock()
         .map_err(|_| io::Error::other("Адаптер Windows уже занят или завершился с ошибкой"))?;
     let desktop = Desktop::current()?;
     let (sender, receiver) = mpsc::sync_channel(4096);
-    let worker = thread::Builder::new()
-        .name("keyo-capture".into())
-        .spawn(move || capture(sender))?;
+    let scenario = thread::scope(|scope| -> io::Result<Option<Scenario>> {
+        let worker = thread::Builder::new()
+            .name("keyo-capture".into())
+            .spawn_scoped(scope, move || capture(sender, cancelled, &mut report))?;
+        let scenario = collect(receiver);
+        worker
+            .join()
+            .map_err(|_| io::Error::other("Поток перехвата завершился с ошибкой"))??;
+        Ok(scenario)
+    })?;
+    if let Some(scenario) = &scenario {
+        validate(scenario, desktop)?;
+    }
+    Ok(scenario)
+}
+
+fn collect(receiver: mpsc::Receiver<Packet>) -> Option<Scenario> {
     let mut recorder = None;
     let mut wheel = Wheel::default();
     for packet in receiver {
         match packet {
             Packet::Started(at) => {
-                println!("Запись началась. Нажми Esc, чтобы завершить.");
                 recorder = Some(Recorder::new(at));
             }
             Packet::Keyboard(at, message, input) => {
@@ -53,29 +93,28 @@ pub fn record() -> io::Result<Option<Scenario>> {
             }
         }
     }
-    worker
-        .join()
-        .map_err(|_| io::Error::other("Поток перехвата завершился с ошибкой"))??;
-    let scenario = recorder.map(Recorder::finish);
-    if let Some(scenario) = &scenario {
-        validate(scenario, desktop)?;
-    }
-    Ok(scenario)
+    recorder.map(Recorder::finish)
 }
 
-fn capture(sender: SyncSender<Packet>) -> io::Result<()> {
+fn capture(
+    sender: SyncSender<Packet>,
+    cancelled: &AtomicBool,
+    report: &mut impl FnMut(RecordingUpdate),
+) -> io::Result<()> {
     let _stop = StopHook::install()?;
     let _mouse = MouseHook::install()?;
-    println!("Запись начнётся через 3 секунды. Переключись в тестовое окно. Остановка: Esc.");
-    if !countdown() {
-        println!("Запись отменена до запуска.");
+    let stop = || cancelled.load(Ordering::Relaxed) || stop_requested();
+    if !countdown_with(stop, wait_for_messages, |seconds| {
+        report(RecordingUpdate::Countdown(seconds));
+    }) {
         return Ok(());
     }
     sender
         .send(Packet::Started(Instant::now()))
         .map_err(|_| io::Error::other("Получатель событий записи недоступен"))?;
     SINK.with(|sink| sink.replace(Some(sender)));
-    while !stop_requested() {
+    report(RecordingUpdate::Recording);
+    while !stop() {
         wait_for_messages();
     }
     SINK.with(|sink| sink.replace(None));
@@ -234,6 +273,31 @@ fn mouse_event(message: u32, input: MSLLHOOKSTRUCT, wheel: &mut Wheel) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collecting_closed_input_retains_recorded_events() {
+        let (sender, receiver) = mpsc::channel();
+        let start = Instant::now();
+        sender.send(Packet::Started(start)).unwrap();
+        sender
+            .send(Packet::Keyboard(
+                start + Duration::from_millis(20),
+                WM_KEYDOWN,
+                KBDLLHOOKSTRUCT {
+                    vkCode: u32::from(b'A'),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        drop(sender);
+        let scenario = collect(receiver).unwrap();
+        assert_eq!(scenario.events.len(), 1);
+        assert_eq!(scenario.events[0].delay_micros, 20_000);
+        assert_eq!(
+            scenario.events[0].event,
+            Event::KeyDown { key: "KeyA".into() }
+        );
+    }
 
     #[test]
     fn filters_injected_keyboard_and_mouse_input() {

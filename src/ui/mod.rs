@@ -12,15 +12,17 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, FontData, FontDefinitions, FontFamily, RichText, Theme};
 use windows_sys::Win32::UI::Controls::Dialogs::{
-    CommDlgExtendedError, GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
-    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST,
+    OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 
 use crate::core::player::PlaybackOutcome;
 use crate::core::scenario::Scenario;
-use crate::platform::windows::{play_with_updates, validate_playback, PlaybackUpdate};
-use crate::storage::read_json;
+use crate::platform::windows::{
+    play_with_updates, record_with_updates, validate_playback, PlaybackUpdate, RecordingUpdate,
+};
+use crate::storage::{read_json, write_json_new};
 
 const WINDOW_SIZE: [f32; 2] = [620.0, 255.0];
 
@@ -48,6 +50,26 @@ struct Loaded {
     scenario: Arc<Scenario>,
 }
 
+impl Loaded {
+    fn new(path: PathBuf, scenario: Arc<Scenario>) -> Self {
+        let duration = scenario
+            .events
+            .iter()
+            .map(|event| Duration::from_micros(event.delay_micros))
+            .sum();
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        Self {
+            name,
+            duration,
+            scenario,
+        }
+    }
+}
+
 #[derive(Default)]
 enum Status {
     #[default]
@@ -56,6 +78,12 @@ enum Status {
     Preparing,
     Countdown(u8),
     Playing(Instant),
+    Recording,
+    RecordingReady,
+    RecordingCancelled,
+    Unsaved,
+    Saving,
+    Saved,
     Stopping,
     Finished(PlaybackOutcome),
     Error(String),
@@ -63,13 +91,16 @@ enum Status {
 
 enum Message {
     Opened(io::Result<Option<Loaded>>),
-    Progress(PlaybackUpdate),
+    Progress(Status),
     Finished(io::Result<PlaybackOutcome>),
+    Recorded(io::Result<Option<Scenario>>),
+    Saved(io::Result<Option<Loaded>>),
 }
 
 struct Job {
     messages: Receiver<Message>,
     stop: Option<Arc<AtomicBool>>,
+    recording: bool,
 }
 
 impl Drop for Job {
@@ -86,13 +117,15 @@ struct MainWindow {
     job: Option<Job>,
     status: Status,
     closing: bool,
+    pending_recording: Option<Arc<Scenario>>,
+    record_owner: isize,
 }
 
 impl MainWindow {
     fn open(&mut self, context: &egui::Context) {
         // SAFETY: получаем HWND активного окна в потоке интерфейса.
         let owner = unsafe { GetActiveWindow() } as isize;
-        self.start_job(context, None, Status::Opening, move |send| {
+        self.start_job(context, None, false, Status::Opening, move |send| {
             send(Message::Opened(load_selected(owner)));
         });
     }
@@ -102,11 +135,48 @@ impl MainWindow {
         let scenario = Arc::clone(&loaded.scenario);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        self.start_job(context, Some(stop), Status::Preparing, move |send| {
+        self.start_job(context, Some(stop), false, Status::Preparing, move |send| {
             let result = play_with_updates((*scenario).clone(), &worker_stop, |update| {
-                send(Message::Progress(update));
+                send(Message::Progress(match update {
+                    PlaybackUpdate::Countdown(seconds) => Status::Countdown(seconds),
+                    PlaybackUpdate::Playing => Status::Playing(Instant::now()),
+                }));
             });
             send(Message::Finished(result));
+        });
+    }
+
+    fn record(&mut self, context: &egui::Context) {
+        // SAFETY: сохраняем HWND окна, из которого пользователь запустил запись.
+        self.record_owner = unsafe { GetActiveWindow() } as isize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        self.start_job(context, Some(stop), true, Status::Preparing, move |send| {
+            let result = record_with_updates(&worker_stop, |update| {
+                send(Message::Progress(match update {
+                    RecordingUpdate::Countdown(seconds) => Status::Countdown(seconds),
+                    RecordingUpdate::Recording => Status::Recording,
+                }));
+            });
+            send(Message::Recorded(result));
+        });
+    }
+
+    fn save_recording(&mut self, context: &egui::Context) {
+        let Some(scenario) = &self.pending_recording else {
+            return;
+        };
+        let owner = self.record_owner;
+        let scenario = Arc::clone(scenario);
+        self.start_job(context, None, false, Status::Saving, move |send| {
+            let result = select_json(owner, true).and_then(|path| {
+                path.map(|path| {
+                    write_json_new(&path, &scenario)?;
+                    Ok(Loaded::new(path, scenario))
+                })
+                .transpose()
+            });
+            send(Message::Saved(result));
         });
     }
 
@@ -114,8 +184,9 @@ impl MainWindow {
         &mut self,
         context: &egui::Context,
         stop: Option<Arc<AtomicBool>>,
+        recording: bool,
         status: Status,
-        work: impl FnOnce(&dyn Fn(Message)) + Send + 'static,
+        work: impl FnOnce(&(dyn Fn(Message) + Sync)) + Send + 'static,
     ) {
         let (sender, messages) = mpsc::channel();
         let context = context.clone();
@@ -131,7 +202,11 @@ impl MainWindow {
             });
         match worker {
             Ok(_) => {
-                self.job = Some(Job { messages, stop });
+                self.job = Some(Job {
+                    messages,
+                    stop,
+                    recording,
+                });
                 self.status = status;
             }
             Err(error) => {
@@ -150,12 +225,9 @@ impl MainWindow {
     fn poll_messages(&mut self) {
         while let Some(job) = &self.job {
             match job.messages.try_recv() {
-                Ok(Message::Progress(update)) => {
+                Ok(Message::Progress(status)) => {
                     if !matches!(self.status, Status::Stopping) {
-                        self.status = match update {
-                            PlaybackUpdate::Countdown(seconds) => Status::Countdown(seconds),
-                            PlaybackUpdate::Playing => Status::Playing(Instant::now()),
-                        };
+                        self.status = status;
                     }
                 }
                 Ok(Message::Opened(result)) => {
@@ -179,6 +251,33 @@ impl MainWindow {
                         Err(error) => Status::Error(format!("Воспроизведение прервано. {error}")),
                     };
                 }
+                Ok(Message::Recorded(result)) => {
+                    self.job = None;
+                    self.status = match result {
+                        Ok(Some(scenario)) => {
+                            self.pending_recording = Some(Arc::new(scenario));
+                            Status::RecordingReady
+                        }
+                        Ok(None) => Status::RecordingCancelled,
+                        Err(error) => {
+                            Status::Error(format!("Не удалось записать сценарий. {error}"))
+                        }
+                    };
+                }
+                Ok(Message::Saved(result)) => {
+                    self.job = None;
+                    self.status = match result {
+                        Ok(Some(loaded)) => {
+                            self.pending_recording = None;
+                            self.loaded = Some(loaded);
+                            Status::Saved
+                        }
+                        Ok(None) => Status::Unsaved,
+                        Err(error) => {
+                            Status::Error(format!("Не удалось сохранить запись. {error}"))
+                        }
+                    };
+                }
                 Err(TryRecvError::Disconnected) => {
                     self.job = None;
                     self.status = Status::Error("Фоновая задача завершилась без результата".into());
@@ -192,16 +291,25 @@ impl MainWindow {
 impl eframe::App for MainWindow {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
-        if ctx.input(|input| input.viewport().close_requested()) && self.playback_active() {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested && self.input_active() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.closing = true;
+            self.closing = !self.recording_active();
             self.stop();
+        } else if close_requested && self.pending_recording.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.job.is_none() && !matches!(self.status, Status::RecordingReady) {
+                self.status = Status::Unsaved;
+            }
         }
         if self.closing && self.job.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.stop();
+        }
+        if matches!(self.status, Status::RecordingReady) {
+            self.save_recording(ctx);
         }
     }
 
@@ -239,7 +347,35 @@ impl MainWindow {
             Color32::from_gray(89)
         };
         egui::Frame::new().inner_margin(25).show(ui, |ui| {
-            ui.label(RichText::new("Сценарий").size(29.0).strong());
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 36.0),
+                egui::Layout::right_to_left(Align::Center),
+                |ui| {
+                    if self.pending_recording.is_some() {
+                        if ui
+                            .add_enabled(self.job.is_none(), egui::Button::new("Сохранить JSON"))
+                            .clicked()
+                        {
+                            self.save_recording(&context);
+                        }
+                        if ui
+                            .add_enabled(self.job.is_none(), egui::Button::new("Отбросить запись"))
+                            .clicked()
+                        {
+                            self.pending_recording = None;
+                            self.status = Status::Ready;
+                        }
+                    } else if ui
+                        .add_enabled(self.job.is_none(), egui::Button::new("Записать"))
+                        .clicked()
+                    {
+                        self.record(&context);
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(RichText::new("Сценарий").size(29.0).strong());
+                    });
+                },
+            );
             ui.add_space(15.0);
             egui::Frame::new()
                 .fill(surface)
@@ -253,7 +389,7 @@ impl MainWindow {
                         |ui| {
                             if ui
                                 .add_enabled(
-                                    self.job.is_none(),
+                                    self.job.is_none() && self.pending_recording.is_none(),
                                     egui::Button::new("Открыть JSON")
                                         .min_size(egui::vec2(120.0, 36.0)),
                                 )
@@ -289,7 +425,7 @@ impl MainWindow {
                 egui::vec2(ui.available_width(), 44.0),
                 egui::Layout::right_to_left(Align::Center),
                 |ui| {
-                    let active = self.playback_active();
+                    let active = self.input_active();
                     let (label, fill, foreground) = if active {
                         let fill = if dark {
                             Color32::from_rgb(255, 179, 180)
@@ -312,8 +448,9 @@ impl MainWindow {
                         .loaded
                         .as_ref()
                         .is_some_and(|loaded| !loaded.scenario.events.is_empty());
-                    let enabled = (active && !matches!(self.status, Status::Stopping))
-                        || (self.job.is_none() && has_events);
+                    let enabled = (active
+                        && !matches!(self.status, Status::Stopping | Status::Recording))
+                        || (self.job.is_none() && self.pending_recording.is_none() && has_events);
                     if ui
                         .add_enabled(
                             enabled,
@@ -340,11 +477,14 @@ impl MainWindow {
                         if active {
                             let hint = if matches!(self.status, Status::Countdown(_)) {
                                 "Переключись в тестовое окно. Esc — остановить"
+                            } else if matches!(self.status, Status::Recording) {
+                                "Esc — завершить запись"
                             } else {
                                 "Esc — остановить"
                             };
                             ui.label(RichText::new(hint).color(weak));
-                        } else if has_events && !matches!(self.status, Status::Error(_)) {
+                        } else if has_events && matches!(self.status, Status::Ready | Status::Saved)
+                        {
                             ui.label(
                                 RichText::new("После запуска переключись в тестовое окно.")
                                     .color(weak),
@@ -366,8 +506,12 @@ impl MainWindow {
 }
 
 impl MainWindow {
-    fn playback_active(&self) -> bool {
+    fn input_active(&self) -> bool {
         self.job.as_ref().is_some_and(|job| job.stop.is_some())
+    }
+
+    fn recording_active(&self) -> bool {
+        self.job.as_ref().is_some_and(|job| job.recording)
     }
 
     fn status_text(&self) -> String {
@@ -383,9 +527,19 @@ impl MainWindow {
             }
             Status::Ready => "Готово к запуску".into(),
             Status::Opening => "Открытие сценария…".into(),
+            Status::Preparing if self.recording_active() => "Подготовка записи…".into(),
             Status::Preparing => "Проверка сценария…".into(),
+            Status::Countdown(seconds) if self.recording_active() => {
+                format!("Запись через {seconds} с")
+            }
             Status::Countdown(seconds) => format!("Запуск через {seconds} с"),
             Status::Playing(_) => "Идёт воспроизведение".into(),
+            Status::Recording => "Идёт запись".into(),
+            Status::RecordingReady => "Запись завершена".into(),
+            Status::RecordingCancelled => "Запись отменена до запуска".into(),
+            Status::Unsaved => "Сохрани или отбрось запись".into(),
+            Status::Saving => "Сохранение записи…".into(),
+            Status::Saved => "Запись сохранена".into(),
             Status::Stopping => "Остановка…".into(),
             Status::Finished(PlaybackOutcome::Completed) => "Воспроизведение завершено".into(),
             Status::Finished(PlaybackOutcome::Stopped) => "Воспроизведение остановлено".into(),
@@ -446,34 +600,27 @@ fn configure_style(context: &egui::Context) {
 }
 
 fn load_selected(owner: isize) -> io::Result<Option<Loaded>> {
-    let Some(path) = select_json(owner)? else {
+    let Some(path) = select_json(owner, false)? else {
         return Ok(None);
     };
     let scenario = read_json(BufReader::new(File::open(&path)?))?;
     validate_playback(&scenario)?;
-    let duration = scenario
-        .events
-        .iter()
-        .map(|event| Duration::from_micros(event.delay_micros))
-        .sum();
-    let name = path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned();
-    Ok(Some(Loaded {
-        name,
-        duration,
-        scenario: Arc::new(scenario),
-    }))
+    Ok(Some(Loaded::new(path, Arc::new(scenario))))
 }
 
-fn select_json(owner: isize) -> io::Result<Option<PathBuf>> {
+fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
     let mut path = vec![0u16; 32_768];
     let filter: Vec<u16> = "Сценарии JSON (*.json)\0*.json\0\0"
         .encode_utf16()
         .collect();
-    let title: Vec<u16> = "Открыть сценарий Keyo\0".encode_utf16().collect();
+    let title: Vec<u16> = if save {
+        "Сохранить сценарий Keyo\0"
+    } else {
+        "Открыть сценарий Keyo\0"
+    }
+    .encode_utf16()
+    .collect();
+    let extension: Vec<u16> = "json\0".encode_utf16().collect();
     let mut dialog = OPENFILENAMEW {
         lStructSize: size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner as _,
@@ -481,11 +628,22 @@ fn select_json(owner: isize) -> io::Result<Option<PathBuf>> {
         lpstrFile: path.as_mut_ptr(),
         nMaxFile: path.len() as u32,
         lpstrTitle: title.as_ptr(),
-        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        lpstrDefExt: extension.as_ptr(),
+        Flags: OFN_EXPLORER
+            | OFN_PATHMUSTEXIST
+            | OFN_NOCHANGEDIR
+            | if save { 0 } else { OFN_FILEMUSTEXIST },
         ..Default::default()
     };
     // SAFETY: все указатели диалога остаются действительными до завершения вызова.
-    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+    let selected = unsafe {
+        if save {
+            GetSaveFileNameW(&mut dialog)
+        } else {
+            GetOpenFileNameW(&mut dialog)
+        }
+    };
+    if selected == 0 {
         // SAFETY: запрашиваем ошибку только что закрытого диалога в том же потоке.
         let error = unsafe { CommDlgExtendedError() };
         return if error == 0 {
@@ -506,6 +664,46 @@ fn select_json(owner: isize) -> io::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_survives_cancelled_save_and_becomes_ready_after_retry() {
+        let scenario =
+            Arc::new(read_json(include_bytes!("../../scenario.json").as_slice()).unwrap());
+        let mut window = MainWindow {
+            pending_recording: Some(Arc::clone(&scenario)),
+            ..Default::default()
+        };
+        let (sender, messages) = mpsc::channel();
+        window.job = Some(Job {
+            messages,
+            stop: None,
+            recording: false,
+        });
+        sender.send(Message::Saved(Ok(None))).unwrap();
+        window.poll_messages();
+        assert!(window.pending_recording.is_some());
+        assert!(window.job.is_none());
+        assert!(matches!(window.status, Status::Unsaved));
+
+        let (sender, messages) = mpsc::channel();
+        window.job = Some(Job {
+            messages,
+            stop: None,
+            recording: false,
+        });
+        sender
+            .send(Message::Saved(Ok(Some(Loaded::new(
+                "recorded.json".into(),
+                scenario,
+            )))))
+            .unwrap();
+        window.poll_messages();
+        assert!(window.pending_recording.is_none());
+        assert!(matches!(window.status, Status::Saved));
+        let loaded = window.loaded.as_ref().unwrap();
+        assert_eq!(loaded.name, "recorded.json");
+        assert_eq!(loaded.duration, Duration::from_millis(5050));
+    }
 
     #[test]
     fn playback_controls_fit_inside_the_window() {
@@ -530,13 +728,14 @@ mod tests {
                 job: running.then(|| Job {
                     messages,
                     stop: Some(Arc::new(AtomicBool::new(false))),
+                    recording: false,
                 }),
                 status: if running {
                     Status::Countdown(2)
                 } else {
                     Status::Ready
                 },
-                closing: false,
+                ..Default::default()
             };
             let mut input = egui::RawInput {
                 screen_rect: Some(rect),
@@ -584,11 +783,12 @@ mod tests {
             job: Some(Job {
                 messages,
                 stop: Some(Arc::clone(&stop)),
+                recording: false,
             }),
             ..Default::default()
         };
         sender
-            .send(Message::Progress(PlaybackUpdate::Countdown(2)))
+            .send(Message::Progress(Status::Countdown(2)))
             .unwrap();
         window.poll_messages();
         assert!(matches!(window.status, Status::Countdown(2)));
@@ -596,11 +796,11 @@ mod tests {
         window.stop();
         assert!(stop.load(Ordering::Relaxed));
         sender
-            .send(Message::Progress(PlaybackUpdate::Playing))
+            .send(Message::Progress(Status::Playing(Instant::now())))
             .unwrap();
         window.poll_messages();
         assert!(matches!(window.status, Status::Stopping));
-        assert!(window.playback_active());
+        assert!(window.input_active());
 
         sender
             .send(Message::Finished(Ok(PlaybackOutcome::Stopped)))
@@ -610,7 +810,7 @@ mod tests {
             window.status,
             Status::Finished(PlaybackOutcome::Stopped)
         ));
-        assert!(!window.playback_active());
+        assert!(!window.input_active());
     }
 
     #[test]
@@ -620,6 +820,7 @@ mod tests {
             job: Some(Job {
                 messages,
                 stop: None,
+                recording: false,
             }),
             status: Status::Opening,
             ..Default::default()
