@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -16,13 +16,19 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO,
+};
 
 use crate::core::player::{PlaybackOptions, PlaybackOutcome, PlaybackPass, RepeatMode};
 use crate::core::scenario::Scenario;
 use crate::platform::windows::{
     play_with_updates, record_with_updates, validate_playback, PlaybackUpdate, RecordingUpdate,
 };
-use crate::storage::{read_json, write_json_new};
+use crate::storage::{read_json, write_json_new, write_json_replace};
+
+mod editor;
+use editor::{Editor, EditorAction};
 
 const WINDOW_SIZE: [f32; 2] = [620.0, 290.0];
 
@@ -44,19 +50,17 @@ pub fn run() -> eframe::Result {
     )
 }
 
+#[derive(Clone)]
 struct Loaded {
     name: String,
+    path: PathBuf,
     duration: Duration,
     scenario: Arc<Scenario>,
 }
 
 impl Loaded {
     fn new(path: PathBuf, scenario: Arc<Scenario>) -> Self {
-        let duration = scenario
-            .events
-            .iter()
-            .map(|event| Duration::from_micros(event.delay_micros))
-            .sum();
+        let duration = Self::duration_of(&scenario);
         let name = path
             .file_name()
             .unwrap_or(path.as_os_str())
@@ -64,9 +68,16 @@ impl Loaded {
             .into_owned();
         Self {
             name,
+            path,
             duration,
             scenario,
         }
+    }
+
+    fn duration_of(scenario: &Scenario) -> Duration {
+        scenario.events.iter().fold(Duration::ZERO, |total, event| {
+            total.saturating_add(Duration::from_micros(event.delay_micros))
+        })
     }
 }
 
@@ -147,8 +158,44 @@ struct MainWindow {
     status: Status,
     closing: bool,
     pending_recording: Option<Arc<Scenario>>,
-    record_owner: isize,
+    dialog_owner: isize,
     playback: PlaybackSettings,
+    editor: Option<Editor>,
+    original: Option<Loaded>,
+    close_prompt: bool,
+}
+
+enum CloseDecision {
+    Save,
+    Discard,
+    Stay,
+}
+
+fn close_dialog(context: &egui::Context, message: &str, can_save: bool) -> Option<CloseDecision> {
+    let dialog = egui::Modal::new(egui::Id::unique(("keyo-close", context.viewport_id()))).show(
+        context,
+        |ui| {
+            ui.heading("Сохранить изменения?");
+            ui.label(message);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Сохранить и закрыть"))
+                    .clicked()
+                {
+                    Some(CloseDecision::Save)
+                } else if ui.button("Закрыть без сохранения").clicked() {
+                    Some(CloseDecision::Discard)
+                } else if ui.button("Отмена").clicked() {
+                    Some(CloseDecision::Stay)
+                } else {
+                    None
+                }
+            })
+            .inner
+        },
+    );
+    let dismissed = dialog.should_close();
+    dialog.inner.or(dismissed.then_some(CloseDecision::Stay))
 }
 
 impl MainWindow {
@@ -179,7 +226,7 @@ impl MainWindow {
 
     fn record(&mut self, context: &egui::Context) {
         // SAFETY: сохраняем HWND окна, из которого пользователь запустил запись.
-        self.record_owner = unsafe { GetActiveWindow() } as isize;
+        self.dialog_owner = unsafe { GetActiveWindow() } as isize;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         self.start_job(context, Some(stop), true, Status::Preparing, move |send| {
@@ -197,18 +244,90 @@ impl MainWindow {
         let Some(scenario) = &self.pending_recording else {
             return;
         };
-        let owner = self.record_owner;
-        let scenario = Arc::clone(scenario);
+        self.save_copy(context, self.dialog_owner, Arc::clone(scenario));
+    }
+
+    fn save_current(&mut self, context: &egui::Context, confirm_overwrite: bool) {
+        if self.pending_recording.is_some() {
+            self.save_recording(context);
+            return;
+        }
+        let Some(loaded) = &self.loaded else { return };
+        let path = loaded.path.clone();
+        let owner = self.dialog_owner;
+        let scenario = Arc::clone(&loaded.scenario);
+        // Черновик редактора переносится только после успешного сохранения.
+        let edited = self.editor.as_ref().map(|editor| editor.scenario.clone());
         self.start_job(context, None, false, Status::Saving, move |send| {
-            let result = select_json(owner, true).and_then(|path| {
-                path.map(|path| {
-                    write_json_new(&path, &scenario)?;
-                    Ok(Loaded::new(path, scenario))
-                })
-                .transpose()
+            let scenario = edited.map_or(scenario, Arc::new);
+            let result = validate_playback(&scenario).and_then(|()| {
+                let saved = if confirm_overwrite {
+                    save_to_path(&path, &scenario, |path| confirm_replace(owner, path))?
+                } else {
+                    write_json_replace(&path, &scenario)?;
+                    true
+                };
+                Ok(saved.then(|| Loaded::new(path, scenario)))
             });
             send(Message::Saved(result));
         });
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.pending_recording.is_some()
+            || self.original.is_some()
+            || self.editor.as_ref().is_some_and(Editor::has_unsaved_input)
+    }
+
+    fn handle_close_request(&mut self, context: &egui::Context) {
+        if self.input_active() {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = true;
+            self.stop();
+        } else if self.has_unsaved_changes() {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_prompt = true;
+        }
+    }
+
+    fn resolve_close(&mut self, choice: CloseDecision, context: &egui::Context) {
+        self.close_prompt = false;
+        match choice {
+            CloseDecision::Save => {
+                self.save_current(context, false);
+                self.closing = self.job.is_some();
+            }
+            CloseDecision::Discard => {
+                self.editor = None;
+                self.original = None;
+                self.pending_recording = None;
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            CloseDecision::Stay => {}
+        }
+    }
+
+    fn save_copy(&mut self, context: &egui::Context, owner: isize, scenario: Arc<Scenario>) {
+        self.start_job(context, None, false, Status::Saving, move |send| {
+            let result = select_json(owner, true).and_then(|path| {
+                let Some(path) = path else { return Ok(None) };
+                validate_playback(&scenario)?;
+                let saved = save_to_path(&path, &scenario, |path| confirm_replace(owner, path))?;
+                Ok(saved.then(|| Loaded::new(path, scenario)))
+            });
+            send(Message::Saved(result));
+        });
+    }
+
+    fn finish_editing(&mut self, action: EditorAction) {
+        let editor = self.editor.take().unwrap();
+        if matches!(action, EditorAction::Apply) && editor.changed {
+            let loaded = self.loaded.as_mut().unwrap();
+            self.original.get_or_insert_with(|| loaded.clone());
+            loaded.duration = Loaded::duration_of(&editor.scenario);
+            loaded.scenario = Arc::new(editor.scenario);
+            self.status = Status::Unsaved;
+        }
     }
 
     fn start_job(
@@ -300,17 +419,28 @@ impl MainWindow {
                     self.status = match result {
                         Ok(Some(loaded)) => {
                             self.pending_recording = None;
+                            self.original = None;
+                            self.editor = None;
                             self.loaded = Some(loaded);
                             Status::Saved
                         }
-                        Ok(None) => Status::Unsaved,
+                        Ok(None) => {
+                            self.closing = false;
+                            Status::Unsaved
+                        }
                         Err(error) => {
-                            Status::Error(format!("Не удалось сохранить запись. {error}"))
+                            self.closing = false;
+                            let error = format!("Не удалось сохранить сценарий. {error}");
+                            if let Some(editor) = &mut self.editor {
+                                editor.show_save_error(error.clone());
+                            }
+                            Status::Error(error)
                         }
                     };
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.job = None;
+                    self.closing = false;
                     self.status = Status::Error("Фоновая задача завершилась без результата".into());
                 }
                 Err(TryRecvError::Empty) => break,
@@ -322,30 +452,52 @@ impl MainWindow {
 impl eframe::App for MainWindow {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
-        let close_requested = ctx.input(|input| input.viewport().close_requested());
-        if close_requested && self.input_active() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.closing = !self.recording_active();
-            self.stop();
-        } else if close_requested && self.pending_recording.is_some() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.job.is_none() && !matches!(self.status, Status::RecordingReady) {
-                self.status = Status::Unsaved;
-            }
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.handle_close_request(ctx);
         }
         if self.closing && self.job.is_none() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.closing = false;
+            if self.has_unsaved_changes() {
+                self.close_prompt = true;
+                if matches!(self.status, Status::RecordingReady) {
+                    self.status = Status::Unsaved;
+                }
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.stop();
         }
-        if matches!(self.status, Status::RecordingReady) {
+        if matches!(self.status, Status::RecordingReady) && !self.close_prompt {
             self.save_recording(ctx);
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.draw(ui);
+        let context = ui.ctx().clone();
+        ui.add_enabled_ui(self.editor.is_none(), |ui| self.draw(ui));
+        let file_name = self.loaded.as_ref().map(|loaded| loaded.name.as_str());
+        if self.close_prompt {
+            let can_save = self.job.is_none() && self.editor.as_ref().is_none_or(Editor::can_apply);
+            if self.job.is_none() {
+                let message = match file_name.filter(|_| self.pending_recording.is_none()) {
+                    Some(name) => format!("Сохранение перезапишет файл «{name}»."),
+                    None => "Запись ещё не сохранена. Keyo предложит выбрать файл.".into(),
+                };
+                if let Some(choice) = close_dialog(&context, &message, can_save) {
+                    self.resolve_close(choice, &context);
+                }
+            }
+        } else if let Some(action) = self.editor.as_mut().and_then(|editor| {
+            editor.show(&context, file_name.unwrap_or_default(), self.job.is_some())
+        }) {
+            if matches!(action, EditorAction::SaveAndClose) {
+                self.save_current(&context, false);
+            } else {
+                self.finish_editing(action);
+            }
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -396,6 +548,23 @@ impl MainWindow {
                             self.pending_recording = None;
                             self.status = Status::Ready;
                         }
+                    } else if self.original.is_some() {
+                        if ui
+                            .add_enabled(
+                                self.job.is_none(),
+                                egui::Button::new("Сохранить изменения"),
+                            )
+                            .clicked()
+                        {
+                            self.save_current(&context, true);
+                        }
+                        if ui
+                            .add_enabled(self.job.is_none(), egui::Button::new("Отбросить правки"))
+                            .clicked()
+                        {
+                            self.loaded = self.original.take();
+                            self.status = Status::Ready;
+                        }
                     } else if ui
                         .add_enabled(self.job.is_none(), egui::Button::new("Записать"))
                         .clicked()
@@ -420,13 +589,29 @@ impl MainWindow {
                         |ui| {
                             if ui
                                 .add_enabled(
-                                    self.job.is_none() && self.pending_recording.is_none(),
+                                    self.job.is_none()
+                                        && self.pending_recording.is_none()
+                                        && self.original.is_none(),
                                     egui::Button::new("Открыть JSON")
                                         .min_size(egui::vec2(120.0, 36.0)),
                                 )
                                 .clicked()
                             {
                                 self.open(&context);
+                            }
+                            if let Some(loaded) = &self.loaded {
+                                if ui
+                                    .add_enabled(
+                                        self.job.is_none() && self.pending_recording.is_none(),
+                                        egui::Button::new("Редактировать")
+                                            .min_size(egui::vec2(116.0, 36.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    // SAFETY: здесь ещё активно основное окно, владелец диалога сохранения.
+                                    self.dialog_owner = unsafe { GetActiveWindow() } as isize;
+                                    self.editor = Some(Editor::new((*loaded.scenario).clone()));
+                                }
                             }
                             ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
                                 if let Some(loaded) = &self.loaded {
@@ -439,8 +624,13 @@ impl MainWindow {
                                         .replace('.', ",");
                                     ui.label(
                                         RichText::new(format!(
-                                            "{} · {seconds} с",
+                                            "{} · {seconds} с{}",
                                             event_count(loaded.scenario.events.len()),
+                                            if self.original.is_some() {
+                                                " · есть правки"
+                                            } else {
+                                                ""
+                                            },
                                         ))
                                         .color(weak),
                                     );
@@ -593,9 +783,10 @@ impl MainWindow {
             Status::Recording => "Идёт запись".into(),
             Status::RecordingReady => "Запись завершена".into(),
             Status::RecordingCancelled => "Запись отменена до запуска".into(),
+            Status::Unsaved if self.original.is_some() => "Сохрани копию или отбрось правки".into(),
             Status::Unsaved => "Сохрани или отбрось запись".into(),
-            Status::Saving => "Сохранение записи…".into(),
-            Status::Saved => "Запись сохранена".into(),
+            Status::Saving => "Сохранение сценария…".into(),
+            Status::Saved => "Сценарий сохранён".into(),
             Status::Stopping => "Остановка…".into(),
             Status::Finished(PlaybackOutcome::Completed) => "Воспроизведение завершено".into(),
             Status::Finished(PlaybackOutcome::Stopped) => "Воспроизведение остановлено".into(),
@@ -674,6 +865,44 @@ fn load_selected(owner: isize) -> io::Result<Option<Loaded>> {
     Ok(Some(Loaded::new(path, Arc::new(scenario))))
 }
 
+fn save_to_path(
+    path: &Path,
+    scenario: &Scenario,
+    confirm: impl FnOnce(&Path) -> bool,
+) -> io::Result<bool> {
+    match write_json_new(path, scenario) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if !confirm(path) {
+                return Ok(false);
+            }
+            write_json_replace(path, scenario)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn confirm_replace(owner: isize, path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    let text: Vec<u16> = format!("Файл «{name}» уже существует. Перезаписать сценарий?\0")
+        .encode_utf16()
+        .collect();
+    let title: Vec<u16> = "Подтверждение перезаписи — Keyo\0".encode_utf16().collect();
+    // SAFETY: обе строки завершаются нулём и остаются доступны до закрытия диалога.
+    unsafe {
+        MessageBoxW(
+            owner as _,
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+}
+
 fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
     let mut path = vec![0u16; 32_768];
     let filter: Vec<u16> = "Сценарии JSON (*.json)\0*.json\0\0"
@@ -730,6 +959,148 @@ fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_a_saved_scenario_requires_confirmation() {
+        let path = std::env::temp_dir().join(format!("keyo-confirm-{}.json", std::process::id()));
+        let original = Scenario { events: vec![] };
+        let replacement = read_json(include_bytes!("../../scenario.json").as_slice()).unwrap();
+        assert!(save_to_path(&path, &original, |_| unreachable!()).unwrap());
+        let declined = save_to_path(&path, &replacement, |chosen| {
+            assert_eq!(chosen, path);
+            false
+        })
+        .unwrap();
+        let remaining = read_json(fs::read(&path).unwrap().as_slice()).unwrap();
+        let accepted = save_to_path(&path, &replacement, |_| true).unwrap();
+        let saved = read_json(fs::read(&path).unwrap().as_slice()).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(!declined);
+        assert_eq!(remaining, original);
+        assert!(accepted);
+        assert_eq!(saved, replacement);
+    }
+
+    #[test]
+    fn failed_save_during_close_keeps_editor_open() {
+        let (sender, messages) = mpsc::channel();
+        let mut editor = Editor::new(Scenario { events: vec![] });
+        editor.changed = true;
+        let mut window = MainWindow {
+            editor: Some(editor),
+            job: Some(Job {
+                messages,
+                stop: None,
+                recording: false,
+            }),
+            closing: true,
+            ..Default::default()
+        };
+        sender
+            .send(Message::Saved(Err(io::Error::other(
+                "Ошибка тестовой записи",
+            ))))
+            .unwrap();
+        window.poll_messages();
+        assert!(window.editor.as_ref().unwrap().changed);
+        assert!(!window.closing);
+        assert!(matches!(window.status, Status::Error(_)));
+    }
+
+    #[test]
+    fn applying_edits_changes_playback_data_without_mutating_the_original() {
+        let original =
+            Arc::new(read_json(include_bytes!("../../scenario.json").as_slice()).unwrap());
+        let mut editor = Editor::new((*original).clone());
+        editor.scenario.events[0].delay_micros = 1_000_000;
+        editor.changed = true;
+        let mut window = MainWindow {
+            loaded: Some(Loaded::new("scenario.json".into(), Arc::clone(&original))),
+            editor: Some(editor),
+            ..Default::default()
+        };
+        window.finish_editing(EditorAction::Apply);
+        assert!(matches!(window.status, Status::Unsaved));
+        assert_eq!(
+            window.loaded.as_ref().unwrap().duration,
+            Duration::from_millis(1050)
+        );
+        assert!(Arc::ptr_eq(
+            &window.original.as_ref().unwrap().scenario,
+            &original
+        ));
+        assert_eq!(original.events[0].delay_micros, 5_000_000);
+    }
+
+    #[test]
+    fn editor_keeps_controls_visible_with_a_long_scenario() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, [680.0, 360.0].into());
+        let context = egui::Context::default();
+        configure_style(&context);
+        let sample = read_json(include_bytes!("../../scenario.json").as_slice()).unwrap();
+        let mut editor = Editor::new(Scenario {
+            events: (0..50)
+                .flat_map(|_| sample.events.iter().cloned())
+                .collect(),
+        });
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                editor.draw(ui);
+            },
+        );
+        output.textures_delta.clear();
+        for label in ["Готово", "Удалить событие", "Добавить позицию"]
+        {
+            assert!(
+                output.shapes.iter().any(|clipped| {
+                    let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                        return false;
+                    };
+                    text.galley.text() == label
+                        && rect.contains_rect(text.visual_bounding_rect())
+                        && clipped.clip_rect.contains_rect(text.visual_bounding_rect())
+                }),
+                "Обрезана кнопка «{label}»"
+            );
+        }
+    }
+
+    #[test]
+    fn close_only_waits_for_unsaved_work_or_running_input() {
+        let context = egui::Context::default();
+        let mut window = MainWindow::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            window.handle_close_request(ui.ctx());
+        });
+        output.textures_delta.clear();
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::CancelClose));
+
+        window.pending_recording = Some(Arc::new(Scenario { events: vec![] }));
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            window.handle_close_request(ui.ctx());
+        });
+        output.textures_delta.clear();
+        assert!(window.close_prompt);
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::CancelClose));
+
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            window.resolve_close(CloseDecision::Discard, ui.ctx());
+        });
+        output.textures_delta.clear();
+        assert!(!window.has_unsaved_changes());
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Close));
+    }
 
     #[test]
     fn unlimited_mode_keeps_the_count_for_the_next_finite_run() {
@@ -802,6 +1173,7 @@ mod tests {
             let mut window = MainWindow {
                 loaded: Some(Loaded {
                     name: "scenario.json".into(),
+                    path: "scenario.json".into(),
                     duration: Duration::from_millis(5_050),
                     scenario: Arc::new(scenario),
                 }),
@@ -912,6 +1284,7 @@ mod tests {
         sender
             .send(Message::Opened(Ok(Some(Loaded {
                 name: "scenario.json".into(),
+                path: "scenario.json".into(),
                 duration: Duration::from_millis(5_050),
                 scenario: Arc::new(scenario),
             }))))

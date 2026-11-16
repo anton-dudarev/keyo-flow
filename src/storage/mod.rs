@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -60,4 +61,62 @@ pub fn write_json_new(path: &Path, scenario: &Scenario) -> io::Result<()> {
         let _ = fs::remove_file(path);
     }
     result
+}
+
+/// Заменяет файл только после успешной записи и сброса буфера нового JSON.
+pub fn write_json_replace(path: &Path, scenario: &Scenario) -> io::Result<()> {
+    write_replacement(path, |writer| {
+        write_json(writer, scenario).map_err(io::Error::from)
+    })
+}
+
+fn write_replacement(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+) -> io::Result<()> {
+    static TEMP_NUMBER: AtomicU64 = AtomicU64::new(0);
+    let (temporary, file) = loop {
+        let number = TEMP_NUMBER.fetch_add(1, Ordering::Relaxed);
+        let candidate = path.with_file_name(format!(".keyo-{}-{number}.tmp", std::process::id()));
+        match File::create_new(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
+    let mut writer = BufWriter::new(file);
+    let written = write(&mut writer)
+        .and_then(|()| writer.flush())
+        .and_then(|()| writer.get_ref().sync_all());
+    drop(writer);
+    let result = written.and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_keeps_original_when_writing_fails() {
+        let dir = std::env::temp_dir().join(format!("keyo-replace-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("scenario.json");
+        let original = b"{\"version\":1,\"events\":[]}";
+        fs::write(&path, original).unwrap();
+        let result = write_replacement(&path, |writer| {
+            writer.write_all(b"incomplete")?;
+            Err(io::Error::other("Ошибка тестовой записи"))
+        });
+        let contents = fs::read(&path).unwrap();
+        let count = fs::read_dir(&dir).unwrap().count();
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        assert!(result.is_err());
+        assert_eq!(contents, original);
+        assert_eq!(count, 1);
+    }
 }

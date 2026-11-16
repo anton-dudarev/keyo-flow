@@ -328,6 +328,11 @@ fn keyboard_code(key: &str) -> io::Result<(u16, u32)> {
     Ok((code, if extended { KEYEVENTF_EXTENDEDKEY } else { 0 }))
 }
 
+#[cfg(feature = "gui")]
+pub(crate) fn validate_event(event: &Event) -> io::Result<()> {
+    Desktop::current()?.convert(event).map(|_| ())
+}
+
 fn mouse(dx: i32, dy: i32, data: u32, flags: u32) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
