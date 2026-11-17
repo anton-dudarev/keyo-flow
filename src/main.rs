@@ -7,7 +7,7 @@ use keyo_flow::core::scenario::Scenario;
 use keyo_flow::storage::read_json;
 
 const USAGE: &str =
-    "Использование:\n  keyo play <файл.json> [--dry-run]\n  keyo record <файл.json>";
+    "Использование:\n  keyo-cli play <файл.json> [--dry-run]\n  keyo-cli record <файл.json>";
 
 fn main() -> ExitCode {
     match run() {

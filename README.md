@@ -46,7 +46,7 @@ cargo run --locked --features gui --bin keyo-gui
 Запусти команду с новым именем файла:
 
 ```sh
-cargo run --locked --bin keyo -- record recorded.json
+cargo run --locked --bin keyo-cli -- record recorded.json
 ```
 
 Переключись в тестовое окно за три секунды, дождись начала записи и выполни проверяемые действия. Чтобы завершить запись и сохранить сценарий, вернись в консоль и нажми `Ctrl+C`. Существующий файл защищён от перезаписи.
@@ -58,7 +58,7 @@ cargo run --locked --bin keyo -- record recorded.json
 Проверь готовый JSON-сценарий перед запуском:
 
 ```sh
-cargo run --locked --bin keyo -- play scenario.json --dry-run
+cargo run --locked --bin keyo-cli -- play scenario.json --dry-run
 ```
 
 Для реального прогона убери `--dry-run`. Через три секунды Keyo один раз воспроизведёт сценарий с исходной скоростью в текущем активном окне. За это время переключись в тестовое окно. Нажми `Esc`, чтобы отменить запуск или остановить воспроизведение.
