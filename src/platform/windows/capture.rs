@@ -282,10 +282,10 @@ fn is_physical_mouse(flags: u32) -> bool {
     flags & LLMHF_INJECTED == 0
 }
 
-struct MouseHook(HHOOK);
+pub(super) struct MouseHook(HHOOK);
 
 impl MouseHook {
-    fn install() -> io::Result<Self> {
+    pub(super) fn install() -> io::Result<Self> {
         // SAFETY: Windows получает статический обработчик с ABI Windows.
         let handle = unsafe {
             let module = GetModuleHandleW(std::ptr::null());
@@ -309,7 +309,11 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
     if code == HC_ACTION as i32 {
         // SAFETY: для HC_ACTION Windows передаёт указатель на MSLLHOOKSTRUCT.
         let input = unsafe { *(data as *const MSLLHOOKSTRUCT) };
-        if is_physical_mouse(input.flags) {
+        let physical = is_physical_mouse(input.flags);
+        if message as u32 == WM_MOUSEMOVE {
+            super::corner::mouse_moved(input.pt, physical);
+        }
+        if physical {
             push(|at| Packet::Mouse(at, message as u32, input));
         }
     }

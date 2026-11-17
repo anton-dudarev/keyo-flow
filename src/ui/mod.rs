@@ -901,9 +901,9 @@ impl MainWindow {
                         "Нажми «Стоп», чтобы завершить запись"
                     }
                 } else if matches!(self.status, Status::Countdown(_)) {
-                    "Переключись в тестовое окно. Esc — остановить"
+                    "Переключись в тестовое окно. Остановка: Esc или верхний левый угол"
                 } else {
-                    "Esc — остановить"
+                    "Остановка: Esc или верхний левый угол основного монитора"
                 };
                 ui.label(RichText::new(hint).color(weak));
             } else if has_events && matches!(self.status, Status::Ready | Status::Saved) {

@@ -22,6 +22,7 @@ use crate::core::player::{self, PlaybackOptions, PlaybackOutcome, PlaybackPass};
 use crate::core::scenario::{Event, MouseButton, Scenario};
 
 mod capture;
+mod corner;
 #[cfg(feature = "gui")]
 pub(crate) mod hotkeys;
 #[cfg(feature = "gui")]
@@ -64,7 +65,7 @@ pub fn play(scenario: Scenario, dry_run: bool) -> io::Result<()> {
         &AtomicBool::new(false),
         |update| match update {
             PlaybackUpdate::Countdown(3) => {
-                println!("Запуск через 3 секунды. Переключись в тестовое окно. Остановка: Esc.");
+                println!("Запуск через 3 секунды. Остановка: Esc или верхний левый угол основного монитора.");
             }
             PlaybackUpdate::Countdown(_) => {}
             PlaybackUpdate::Playing(_) => playing = true,
@@ -102,7 +103,8 @@ pub fn play_with_updates(
     }
 
     let _stop = StopHook::install(true)?;
-    let stop = || cancelled.load(Ordering::Relaxed) || stop_requested();
+    let corner = corner::CornerStop::install()?;
+    let stop = || cancelled.load(Ordering::Relaxed) || stop_requested() || corner.requested();
     if !countdown_with(stop, wait_for_messages, |seconds| {
         report(PlaybackUpdate::Countdown(seconds));
     }) {
