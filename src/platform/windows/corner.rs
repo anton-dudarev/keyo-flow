@@ -36,6 +36,7 @@ mod tests {
         let key = String::from("ControlLeft");
         let (sender, events) = mpsc::channel();
         let scenario = Scenario {
+            coordinates: Default::default(),
             events: vec![
                 TimedEvent {
                     delay_micros: 0,

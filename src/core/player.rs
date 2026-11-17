@@ -115,13 +115,13 @@ pub fn play_with_options(
     options: PlaybackOptions,
     send: impl FnMut(&Event) -> io::Result<()> + Send + 'static,
 ) -> io::Result<Playback> {
-    play_with_guard(scenario, options, || Ok(()), send)
+    play_with_guard(scenario, options, |_| Ok(()), send)
 }
 
 pub(crate) fn play_with_guard(
     scenario: Scenario,
     options: PlaybackOptions,
-    mut before_event: impl FnMut() -> io::Result<()> + Send + 'static,
+    mut before_event: impl FnMut(&Event) -> io::Result<()> + Send + 'static,
     mut send: impl FnMut(&Event) -> io::Result<()> + Send + 'static,
 ) -> io::Result<Playback> {
     options.validate(&scenario)?;
@@ -157,7 +157,7 @@ fn run(
     options: PlaybackOptions,
     stopped: &AtomicBool,
     pass: &Mutex<Option<PlaybackPass>>,
-    before_event: &mut impl FnMut() -> io::Result<()>,
+    before_event: &mut impl FnMut(&Event) -> io::Result<()>,
     send: &mut impl FnMut(&Event) -> io::Result<()>,
 ) -> io::Result<PlaybackOutcome> {
     if scenario.events.is_empty() {
@@ -181,7 +181,7 @@ fn run(
                 input.release_all()?;
                 return Ok(PlaybackOutcome::Stopped);
             }
-            before_event()?;
+            before_event(&timed.event)?;
             input.send(&timed.event)?;
         }
         input.release_all()?;
@@ -231,6 +231,7 @@ mod tests {
         let mut checks = 0;
         let playback = play_with_guard(
             Scenario {
+                coordinates: Default::default(),
                 events: vec![
                     TimedEvent {
                         delay_micros: 0,
@@ -243,7 +244,7 @@ mod tests {
                 ],
             },
             PlaybackOptions::default(),
-            move || {
+            move |_| {
                 checks += 1;
                 if checks > 1 {
                     return Err(io::Error::other("Окно потеряло фокус"));
@@ -274,6 +275,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let playback = play_with_options(
             Scenario {
+                coordinates: Default::default(),
                 events: vec![
                     TimedEvent {
                         delay_micros: 0,
@@ -315,16 +317,24 @@ mod tests {
             repeats: RepeatMode::Infinite,
         };
         assert_eq!(
-            play_with_options(Scenario { events: vec![] }, options, |_| unreachable!())
-                .err()
-                .unwrap()
-                .kind(),
+            play_with_options(
+                Scenario {
+                    coordinates: Default::default(),
+                    events: vec![]
+                },
+                options,
+                |_| unreachable!()
+            )
+            .err()
+            .unwrap()
+            .kind(),
             io::ErrorKind::InvalidInput
         );
         let event = Event::Scroll { x: 0, y: 1 };
         let (sender, receiver) = mpsc::channel();
         let playback = play_with_options(
             Scenario {
+                coordinates: Default::default(),
                 events: vec![TimedEvent {
                     delay_micros: 5_000,
                     event: event.clone(),

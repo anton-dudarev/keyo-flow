@@ -8,13 +8,20 @@ fn recorded_scenario_round_trips_without_overwriting_existing_file() {
 
     let path = std::env::temp_dir().join(format!("keyo-record-{}.json", std::process::id()));
     let scenario = Scenario {
+        coordinates: Default::default(),
         events: vec![TimedEvent {
             delay_micros: 5_000,
             event: Event::MouseMove { x: -90, y: 5 },
         }],
     };
     write_json_new(&path, &scenario).unwrap();
-    let replacement = write_json_new(&path, &Scenario { events: vec![] });
+    let replacement = write_json_new(
+        &path,
+        &Scenario {
+            coordinates: Default::default(),
+            events: vec![],
+        },
+    );
     let contents = fs::read(&path);
     fs::remove_file(&path).unwrap();
 
@@ -83,6 +90,7 @@ fn recorder_preserves_click_position_and_relative_delays() {
 #[test]
 fn json_preserves_all_event_kinds_in_order() {
     let scenario = Scenario {
+        coordinates: Default::default(),
         events: [
             Event::MouseMove { x: -1920, y: 400 },
             Event::MouseDown {
@@ -116,11 +124,25 @@ fn json_preserves_all_event_kinds_in_order() {
 fn json_rejects_unknown_versions() {
     for json in [
         br#"{"version":1,"events":[]}"#,
-        br#"{"version":3,"events":[]}"#,
+        br#"{"version":4,"events":[]}"#,
     ] {
         let error = read_json(json.as_slice()).unwrap_err();
         assert!(error.to_string().contains("unsupported scenario version"));
     }
+}
+
+#[test]
+fn window_scenario_round_trips_and_rejects_out_of_range_coordinates() {
+    let valid = br#"{"version":3,"events":[{"delay_micros":0,"event":{"type":"mouse_move","x":500000,"y":1000000}}]}"#;
+    let scenario = read_json(valid.as_slice()).unwrap();
+    let mut json = Vec::new();
+    write_json(&mut json, &scenario).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(value["version"], 3);
+    assert_eq!(read_json(json.as_slice()).unwrap(), scenario);
+
+    let invalid = br#"{"version":3,"events":[{"delay_micros":0,"event":{"type":"mouse_move","x":-1,"y":1000001}}]}"#;
+    assert!(read_json(invalid.as_slice()).is_err());
 }
 
 mod playback {
@@ -134,6 +156,7 @@ mod playback {
 
     fn scenario(events: &[(u64, Event)]) -> Scenario {
         Scenario {
+            coordinates: Default::default(),
             events: events
                 .iter()
                 .map(|(delay_micros, event)| TimedEvent {

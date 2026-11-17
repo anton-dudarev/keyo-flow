@@ -21,13 +21,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::core::player::{PlaybackOptions, PlaybackOutcome, PlaybackPass, RepeatMode};
-use crate::core::scenario::Scenario;
+use crate::core::scenario::{CoordinateSpace, Scenario};
 use crate::platform::windows::hotkeys::{
     Action as HotkeyAction, HotkeyEvent, HotkeyService, HotkeySettings,
 };
 use crate::platform::windows::target::{open_windows, OpenWindow};
 use crate::platform::windows::{
-    play_with_target, record_with_shortcut, validate_playback, PlaybackUpdate, RecordingUpdate,
+    play_with_target, record_with_target, validate_playback, PlaybackUpdate, RecordingUpdate,
 };
 use crate::storage::{read_json, write_json_new, write_json_replace};
 
@@ -197,6 +197,7 @@ struct MainWindow {
     dialog_owner: isize,
     playback: PlaybackSettings,
     playback_target: Option<OpenWindow>,
+    record_relative: bool,
     editor: Option<Editor>,
     original: Option<Loaded>,
     close_prompt: bool,
@@ -376,13 +377,23 @@ impl MainWindow {
     }
 
     fn record(&mut self, context: &egui::Context) {
+        let target = if self.record_relative {
+            let Some(window) = &self.playback_target else {
+                self.status =
+                    Status::Error("Для записи координат окна выбери тестовое окно".into());
+                return;
+            };
+            Some(window.target)
+        } else {
+            None
+        };
         // SAFETY: сохраняем HWND окна, из которого пользователь запустил запись.
         self.dialog_owner = unsafe { GetActiveWindow() } as isize;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let shortcut = self.hotkey_settings.recording_shortcut();
         self.start_job(context, Some(stop), true, Status::Preparing, move |send| {
-            let result = record_with_shortcut(&worker_stop, shortcut, |update| {
+            let result = record_with_target(&worker_stop, shortcut, target, |update| {
                 send(Message::Progress(match update {
                     RecordingUpdate::Countdown(seconds) => Status::Countdown(seconds),
                     RecordingUpdate::Recording => Status::Recording,
@@ -862,6 +873,11 @@ impl MainWindow {
                                     ))
                                     .color(weak),
                                 );
+                                if loaded.scenario.coordinates == CoordinateSpace::Window {
+                                    ui.label(
+                                        RichText::new("Координаты тестового окна").color(weak),
+                                    );
+                                }
                             });
                         } else {
                             ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
@@ -893,6 +909,10 @@ impl MainWindow {
                     ui.checkbox(&mut self.playback.infinite, "Повторять бесконечно");
                 });
                 self.draw_playback_target(ui);
+                ui.checkbox(
+                    &mut self.record_relative,
+                    "Записывать координаты относительно окна",
+                );
             });
             let text = self.status_text();
             if !text.is_empty() {
@@ -1380,7 +1400,10 @@ mod tests {
     #[test]
     fn replacing_a_saved_scenario_requires_confirmation() {
         let path = std::env::temp_dir().join(format!("keyo-confirm-{}.json", std::process::id()));
-        let original = Scenario { events: vec![] };
+        let original = Scenario {
+            coordinates: Default::default(),
+            events: vec![],
+        };
         let replacement = read_json(include_bytes!("../../scenario.json").as_slice()).unwrap();
         assert!(save_to_path(&path, &original, |_| unreachable!()).unwrap());
         let declined = save_to_path(&path, &replacement, |chosen| {
@@ -1402,7 +1425,10 @@ mod tests {
     #[test]
     fn failed_save_during_close_keeps_editor_open() {
         let (sender, messages) = mpsc::channel();
-        let mut editor = Editor::new(Scenario { events: vec![] });
+        let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
+            events: vec![],
+        });
         editor.changed = true;
         let mut window = MainWindow {
             editor: Some(editor),
@@ -1457,6 +1483,7 @@ mod tests {
         configure_style(&context);
         let sample = read_json(include_bytes!("../../scenario.json").as_slice()).unwrap();
         let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
             events: (0..50)
                 .flat_map(|_| sample.events.iter().cloned())
                 .collect(),
@@ -1499,7 +1526,10 @@ mod tests {
             .commands
             .contains(&egui::ViewportCommand::CancelClose));
 
-        window.pending_recording = Some(Arc::new(Scenario { events: vec![] }));
+        window.pending_recording = Some(Arc::new(Scenario {
+            coordinates: Default::default(),
+            events: vec![],
+        }));
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             window.handle_close_request(ui.ctx());
         });

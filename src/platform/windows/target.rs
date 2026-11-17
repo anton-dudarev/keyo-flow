@@ -1,7 +1,79 @@
 use std::io;
 
-use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
+};
+
+use crate::core::scenario::{CoordinateSpace, WINDOW_COORDINATE_MAX};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClientArea {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl ClientArea {
+    pub(super) fn normalize(self, x: i32, y: i32) -> Option<(i32, i32)> {
+        let normalize = |position, origin, size: i32| {
+            let offset = i64::from(position) - i64::from(origin);
+            if !(0..i64::from(size)).contains(&offset) {
+                return None;
+            }
+            let span = i64::from((size - 1).max(1));
+            Some(((offset * i64::from(WINDOW_COORDINATE_MAX) + span / 2) / span) as i32)
+        };
+        Some((
+            normalize(x, self.x, self.width)?,
+            normalize(y, self.y, self.height)?,
+        ))
+    }
+
+    pub(super) fn resolve(self, x: i32, y: i32) -> io::Result<(i32, i32)> {
+        CoordinateSpace::Window
+            .validate_point(x, y)
+            .map_err(super::invalid)?;
+        let resolve = |fraction, origin, size: i32| {
+            let span = i64::from(size - 1);
+            let scale = i64::from(WINDOW_COORDINATE_MAX);
+            let position = i64::from(origin) + (i64::from(fraction) * span + scale / 2) / scale;
+            i32::try_from(position).map_err(|_| super::invalid("Координата окна вне диапазона"))
+        };
+        Ok((
+            resolve(x, self.x, self.width)?,
+            resolve(y, self.y, self.height)?,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_coordinates_follow_a_moved_and_resized_client_area() {
+        let recorded = ClientArea {
+            x: 200,
+            y: 100,
+            width: 101,
+            height: 201,
+        };
+        let current = ClientArea {
+            x: -500,
+            y: 50,
+            width: 201,
+            height: 101,
+        };
+        assert_eq!(recorded.normalize(250, 200), Some((500_000, 500_000)));
+        assert_eq!(current.resolve(500_000, 500_000).unwrap(), (-400, 100));
+        assert_eq!(current.resolve(1_000_000, 1_000_000).unwrap(), (-300, 150));
+        assert_eq!(recorded.normalize(301, 200), None);
+        assert!(current.resolve(-1, 500_000).is_err());
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlaybackTarget {
@@ -11,6 +83,48 @@ pub(crate) struct PlaybackTarget {
 }
 
 impl PlaybackTarget {
+    pub(super) fn is_foreground(self) -> bool {
+        // SAFETY: получение активного окна не требует входных данных.
+        unsafe { GetForegroundWindow() == self.window as HWND }
+    }
+
+    pub(super) fn check_pointer(self) -> io::Result<()> {
+        let mut point = POINT::default();
+        // SAFETY: Win32 записывает координаты в доступный локальный буфер.
+        if unsafe { GetCursorPos(&mut point) } == 0 {
+            return Err(super::os_error("Не удалось получить положение курсора"));
+        }
+        if self.client_area()?.normalize(point.x, point.y).is_none() {
+            return Err(super::invalid(
+                "Курсор находится за пределами тестового окна",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn client_area(self) -> io::Result<ClientArea> {
+        let window = self.window as HWND;
+        let mut rect = RECT::default();
+        let mut origin = POINT::default();
+        // SAFETY: Win32 получает дескриптор окна и два доступных для записи локальных буфера.
+        if unsafe {
+            GetClientRect(window, &mut rect) == 0 || ClientToScreen(window, &mut origin) == 0
+        } {
+            return Err(super::os_error(
+                "Не удалось получить клиентскую область тестового окна",
+            ));
+        }
+        if rect.right <= 0 || rect.bottom <= 0 {
+            return Err(super::invalid("Клиентская область тестового окна пуста"));
+        }
+        Ok(ClientArea {
+            x: origin.x,
+            y: origin.y,
+            width: rect.right,
+            height: rect.bottom,
+        })
+    }
+
     pub(super) fn check_focus(self) -> io::Result<()> {
         let window = self.window as HWND;
         let mut process = 0;
@@ -19,8 +133,7 @@ impl PlaybackTarget {
         if thread != self.thread || process != self.process {
             return Err(io::Error::other("Выбранное тестовое окно было закрыто"));
         }
-        // SAFETY: получение активного окна не требует входных данных.
-        if unsafe { GetForegroundWindow() } != window {
+        if !self.is_foreground() {
             return Err(io::Error::other("Выбранное тестовое окно не активно"));
         }
         Ok(())

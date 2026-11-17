@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use eframe::egui::{self, Align, RichText};
 
-use crate::core::scenario::{Event, MouseButton, Scenario, TimedEvent};
+use crate::core::scenario::{CoordinateSpace, Event, MouseButton, Scenario, TimedEvent};
 use crate::platform::windows::{key_names, validate_event};
 
 use super::{
@@ -280,7 +280,8 @@ impl Editor {
 
     fn controls(&mut self, ui: &mut egui::Ui) -> bool {
         if let Some(form) = &mut self.form {
-            form.position.fields(ui);
+            let coordinates = self.scenario.coordinates;
+            form.position.fields(ui, coordinates);
             let (apply, cancel) = if form.replace.is_some() {
                 ("Применить", "Отменить правку")
             } else {
@@ -289,7 +290,9 @@ impl Editor {
             let (result, cancelled) = ui
                 .horizontal(|ui| {
                     (
-                        ui.button(apply).clicked().then(|| form.position.event()),
+                        ui.button(apply)
+                            .clicked()
+                            .then(|| form.position.event(coordinates)),
                         ui.button(cancel).clicked(),
                     )
                 })
@@ -546,7 +549,7 @@ impl PositionFields {
         position
     }
 
-    fn fields(&mut self, ui: &mut egui::Ui) {
+    fn fields(&mut self, ui: &mut egui::Ui, coordinates: CoordinateSpace) {
         ui.horizontal(|ui| {
             egui::ComboBox::from_label("Действие")
                 .selected_text(self.kind.name())
@@ -567,6 +570,9 @@ impl PositionFields {
                 let label = ui.label("Y");
                 ui.add(egui::DragValue::new(&mut self.y))
                     .labelled_by(label.id);
+                if self.kind == ActionKind::Move && coordinates == CoordinateSpace::Window {
+                    ui.label("Доли окна, от 0 до 1 000 000");
+                }
             }
             ActionKind::MouseDown | ActionKind::MouseUp => {
                 egui::ComboBox::from_label("Кнопка мыши")
@@ -673,9 +679,9 @@ impl PositionFields {
         })
     }
 
-    fn event(&self) -> Result<TimedEvent, String> {
+    fn event(&self, coordinates: CoordinateSpace) -> Result<TimedEvent, String> {
         let event = self.to_timed_event()?;
-        validate_event(&event.event).map_err(|error| error.to_string())?;
+        validate_event(coordinates, &event.event).map_err(|error| error.to_string())?;
         Ok(event)
     }
 }
@@ -772,6 +778,7 @@ mod tests {
 
     fn editor_with_rows() -> Editor {
         Editor::new(Scenario {
+            coordinates: Default::default(),
             events: [10, 20, 30, 40, 50]
                 .into_iter()
                 .map(|delay_micros| TimedEvent {
@@ -888,6 +895,7 @@ mod tests {
             event: Event::KeyDown { key: "A".into() },
         };
         let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
             events: vec![original.clone()],
         });
         editor.begin_edit(0);
@@ -908,6 +916,7 @@ mod tests {
     fn typing_after_opening_the_picker_goes_to_search() {
         let context = egui::Context::default();
         let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
             events: vec![TimedEvent {
                 delay_micros: 0,
                 event: Event::KeyDown { key: "A".into() },
@@ -955,6 +964,7 @@ mod tests {
             event: Event::KeyDown { key: "A".into() },
         };
         let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
             events: vec![original.clone()],
         });
         editor.begin_edit(0);
@@ -977,7 +987,10 @@ mod tests {
     #[test]
     fn key_picker_keeps_list_height_after_clearing_search() {
         let context = egui::Context::default();
-        let mut editor = Editor::new(Scenario { events: vec![] });
+        let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
+            events: vec![],
+        });
         editor.form = Some(PositionForm {
             position: PositionFields {
                 kind: ActionKind::KeyDown,
@@ -1026,7 +1039,10 @@ mod tests {
     #[test]
     fn key_picker_selects_a_function_key_from_search_results() {
         let context = egui::Context::default();
-        let mut editor = Editor::new(Scenario { events: vec![] });
+        let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
+            events: vec![],
+        });
         editor.form = Some(PositionForm {
             position: PositionFields {
                 kind: ActionKind::KeyDown,
@@ -1064,6 +1080,7 @@ mod tests {
             event: Event::KeyUp { key: "1".into() },
         };
         let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
             events: vec![original.clone()],
         });
         let output = frame(&context, &mut editor, vec![]);
@@ -1099,6 +1116,7 @@ mod tests {
             event: Event::Scroll { x: -2, y: 3 },
         };
         let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
             events: vec![original.clone(), original.clone()],
         });
         editor.begin_edit(1);
@@ -1159,13 +1177,17 @@ mod tests {
             event: Event::Scroll { x: 0, y: 1 },
         };
         let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
             events: vec![old.clone(), old.clone()],
         });
         editor.insert_after_selection(event.clone());
         assert_eq!(editor.scenario.events, [old.clone(), event.clone(), old]);
         assert_eq!(editor.selected, 1);
         assert_eq!(editor.delay, "1,25");
-        let mut empty = Editor::new(Scenario { events: vec![] });
+        let mut empty = Editor::new(Scenario {
+            coordinates: Default::default(),
+            events: vec![],
+        });
         empty.insert_after_selection(event.clone());
         assert_eq!(empty.scenario.events, [event]);
         assert_eq!(empty.selected, 0);
@@ -1175,6 +1197,7 @@ mod tests {
     fn pointer_drag_drops_after_a_non_adjacent_row() {
         let context = egui::Context::default();
         let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
             events: [10, 20, 30, 40]
                 .into_iter()
                 .map(|delay_micros| TimedEvent {

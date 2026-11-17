@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::core::player::{self, PlaybackOptions, PlaybackOutcome, PlaybackPass};
-use crate::core::scenario::{Event, MouseButton, Scenario};
+use crate::core::scenario::{CoordinateSpace, Event, MouseButton, Scenario};
 
 mod capture;
 mod corner;
@@ -27,7 +27,7 @@ mod corner;
 pub(crate) mod hotkeys;
 pub(crate) mod target;
 #[cfg(feature = "gui")]
-pub(crate) use capture::record_with_shortcut;
+pub(crate) use capture::record_with_target;
 pub use capture::{record, record_with_updates, RecordingUpdate};
 
 static STOPPED: AtomicBool = AtomicBool::new(false);
@@ -101,6 +101,12 @@ pub(crate) fn play_with_target(
     mut report: impl FnMut(PlaybackUpdate),
 ) -> io::Result<PlaybackOutcome> {
     options.validate(&scenario)?;
+    let window_coordinates = match scenario.coordinates {
+        CoordinateSpace::Desktop => None,
+        CoordinateSpace::Window => Some(target.ok_or_else(|| invalid(
+            "Сценарий использует координаты окна. Выбери тестовое окно в графическом интерфейсе Keyo",
+        ))?),
+    };
     let _active = ACTIVE
         .try_lock()
         .map_err(|_| io::Error::other("Адаптер Windows уже занят или завершился с ошибкой"))?;
@@ -127,9 +133,29 @@ pub(crate) fn play_with_target(
 
     let check_target = move || target.map_or(Ok(()), target::PlaybackTarget::check_focus);
     check_target()?;
-    let playback = player::play_with_guard(scenario, options, check_target, move |event| {
-        desktop.convert(event)?.send()
-    })?;
+    let playback = player::play_with_guard(
+        scenario,
+        options,
+        move |event| {
+            check_target()?;
+            if let Some(window) = window_coordinates {
+                if matches!(
+                    event,
+                    Event::MouseDown { .. } | Event::MouseUp { .. } | Event::Scroll { .. }
+                ) {
+                    window.check_pointer()?;
+                }
+            }
+            Ok(())
+        },
+        move |event| {
+            if let (Some(window), Event::MouseMove { x, y }) = (window_coordinates, event) {
+                let (x, y) = window.client_area()?.resolve(*x, *y)?;
+                return desktop.convert(&Event::MouseMove { x, y })?.send();
+            }
+            desktop.convert(event)?.send()
+        },
+    )?;
     let mut last_reported = 0;
     let mut focus_error = None;
     loop {
@@ -201,7 +227,7 @@ fn validate(scenario: &Scenario, desktop: Desktop) -> io::Result<()> {
     let mut duration = Duration::ZERO;
     let start = Instant::now();
     for (index, timed) in scenario.events.iter().enumerate() {
-        desktop.convert(&timed.event).map_err(|error| {
+        validate_in_space(desktop, scenario.coordinates, &timed.event).map_err(|error| {
             io::Error::new(error.kind(), format!("Событие {}: {error}", index + 1))
         })?;
         duration = duration
@@ -454,8 +480,19 @@ fn keyboard_code(key: &str) -> io::Result<(u16, u32)> {
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn validate_event(event: &Event) -> io::Result<()> {
-    Desktop::current()?.convert(event).map(|_| ())
+pub(crate) fn validate_event(coordinates: CoordinateSpace, event: &Event) -> io::Result<()> {
+    validate_in_space(Desktop::current()?, coordinates, event)
+}
+
+fn validate_in_space(
+    desktop: Desktop,
+    coordinates: CoordinateSpace,
+    event: &Event,
+) -> io::Result<()> {
+    if let (CoordinateSpace::Window, Event::MouseMove { x, y }) = (coordinates, event) {
+        return coordinates.validate_point(*x, *y).map_err(invalid);
+    }
+    desktop.convert(event).map(|_| ())
 }
 
 fn mouse(dx: i32, dy: i32, data: u32, flags: u32) -> INPUT {
@@ -704,6 +741,7 @@ mod tests {
     #[test]
     fn validation_rejects_unsupported_late_event() {
         let scenario = Scenario {
+            coordinates: Default::default(),
             events: vec![
                 TimedEvent {
                     delay_micros: 0,

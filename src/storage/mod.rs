@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::scenario::{Scenario, TimedEvent};
-
-const FORMAT_VERSION: u32 = 2;
+use crate::core::scenario::{CoordinateSpace, Event, Scenario, TimedEvent};
 
 #[derive(Serialize)]
 struct ScenarioOutput<'a> {
@@ -18,36 +16,57 @@ struct ScenarioOutput<'a> {
 #[derive(Deserialize)]
 struct ScenarioInput {
     #[serde(deserialize_with = "read_version")]
-    version: (),
+    version: CoordinateSpace,
     events: Vec<TimedEvent>,
 }
 
-fn read_version<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+fn read_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<CoordinateSpace, D::Error> {
     let version = u32::deserialize(deserializer)?;
-    if version != FORMAT_VERSION {
-        return Err(serde::de::Error::custom(format!(
+    match version {
+        2 => Ok(CoordinateSpace::Desktop),
+        3 => Ok(CoordinateSpace::Window),
+        _ => Err(serde::de::Error::custom(format!(
             "unsupported scenario version {version}"
-        )));
+        ))),
     }
-    Ok(())
 }
 
 pub fn read_json(reader: impl Read) -> serde_json::Result<Scenario> {
     let ScenarioInput {
-        version: (),
+        version: coordinates,
         events,
     } = serde_json::from_reader(reader)?;
-    Ok(Scenario { events })
+    let scenario = Scenario {
+        coordinates,
+        events,
+    };
+    validate_coordinates(&scenario).map_err(serde::de::Error::custom)?;
+    Ok(scenario)
 }
 
 pub fn write_json(writer: impl Write, scenario: &Scenario) -> serde_json::Result<()> {
+    validate_coordinates(scenario).map_err(serde::ser::Error::custom)?;
     serde_json::to_writer_pretty(
         writer,
         &ScenarioOutput {
-            version: FORMAT_VERSION,
+            version: match scenario.coordinates {
+                CoordinateSpace::Desktop => 2,
+                CoordinateSpace::Window => 3,
+            },
             events: &scenario.events,
         },
     )
+}
+
+fn validate_coordinates(scenario: &Scenario) -> Result<(), &'static str> {
+    for timed in &scenario.events {
+        if let Event::MouseMove { x, y } = timed.event {
+            scenario.coordinates.validate_point(x, y)?;
+        }
+    }
+    Ok(())
 }
 
 /// Сохраняет сценарий в новый файл и сообщает об ошибке, если путь уже занят.

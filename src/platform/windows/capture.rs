@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
+use super::target::{ClientArea, PlaybackTarget};
 use super::*;
 use crate::core::recorder::Recorder;
 
@@ -12,7 +13,7 @@ thread_local! {
 }
 
 enum Packet {
-    Started(Instant),
+    Started(Instant, CoordinateSpace),
     Keyboard(Instant, u32, KBDLLHOOKSTRUCT),
     Mouse(Instant, u32, MSLLHOOKSTRUCT),
     StopShortcut(u32),
@@ -21,6 +22,7 @@ enum Packet {
 struct CaptureSink {
     sender: SyncSender<Packet>,
     shortcut: Option<StopShortcut>,
+    window: Option<(PlaybackTarget, ClientArea)>,
 }
 
 pub fn record() -> io::Result<Option<Scenario>> {
@@ -50,12 +52,13 @@ pub fn record_with_updates(
     cancelled: &AtomicBool,
     report: impl FnMut(RecordingUpdate) + Send,
 ) -> io::Result<Option<Scenario>> {
-    record_with_shortcut(cancelled, None, report)
+    record_with_target(cancelled, None, None, report)
 }
 
-pub(crate) fn record_with_shortcut(
+pub(crate) fn record_with_target(
     cancelled: &AtomicBool,
     shortcut: Option<Chord>,
+    target: Option<PlaybackTarget>,
     mut report: impl FnMut(RecordingUpdate) + Send,
 ) -> io::Result<Option<Scenario>> {
     if cancelled.load(Ordering::Relaxed) {
@@ -70,7 +73,7 @@ pub(crate) fn record_with_shortcut(
         let worker = thread::Builder::new()
             .name("keyo-capture".into())
             .spawn_scoped(scope, move || {
-                capture(sender, cancelled, shortcut, &mut report)
+                capture(sender, cancelled, shortcut, target, &mut report)
             })?;
         let scenario = collect(receiver);
         worker
@@ -86,12 +89,14 @@ pub(crate) fn record_with_shortcut(
 
 fn collect(receiver: mpsc::Receiver<Packet>) -> Option<Scenario> {
     let mut recorder = None;
+    let mut coordinates = CoordinateSpace::Desktop;
     let mut wheel = Wheel::default();
     let mut stop_modifiers = None;
     for packet in receiver {
         match packet {
-            Packet::Started(at) => {
+            Packet::Started(at, space) => {
                 recorder = Some(Recorder::new(at));
+                coordinates = space;
             }
             Packet::Keyboard(at, message, input) => {
                 if let (Some(recorder), Some(event)) =
@@ -116,6 +121,7 @@ fn collect(receiver: mpsc::Receiver<Packet>) -> Option<Scenario> {
     }
     recorder.map(|recorder| {
         let mut scenario = recorder.finish();
+        scenario.coordinates = coordinates;
         if let Some(modifiers) = stop_modifiers {
             remove_stop_modifiers(&mut scenario, modifiers);
         }
@@ -127,6 +133,7 @@ fn capture(
     sender: SyncSender<Packet>,
     cancelled: &AtomicBool,
     shortcut: Option<Chord>,
+    target: Option<PlaybackTarget>,
     report: &mut impl FnMut(RecordingUpdate),
 ) -> io::Result<()> {
     let _stop = StopHook::install(false)?;
@@ -137,17 +144,34 @@ fn capture(
     }) {
         return Ok(());
     }
+    let window = if let Some(target) = target {
+        target.check_focus()?;
+        Some((target, target.client_area()?))
+    } else {
+        None
+    };
+    let coordinates = if window.is_some() {
+        CoordinateSpace::Window
+    } else {
+        CoordinateSpace::Desktop
+    };
     sender
-        .send(Packet::Started(Instant::now()))
+        .send(Packet::Started(Instant::now(), coordinates))
         .map_err(|_| io::Error::other("Получатель событий записи недоступен"))?;
     SINK.with(|sink| {
         sink.replace(Some(CaptureSink {
             sender,
             shortcut: shortcut.map(StopShortcut::from_pressed_keys),
+            window,
         }))
     });
     report(RecordingUpdate::Recording);
     while !stop() {
+        if let Some((target, area)) = window {
+            if target.check_focus().is_err() || target.client_area().ok() != Some(area) {
+                break;
+            }
+        }
         wait_for_messages();
     }
     SINK.with(|sink| sink.replace(None));
@@ -159,13 +183,30 @@ fn capture(
     Ok(())
 }
 
-fn push(make_packet: impl FnOnce(Instant) -> Packet) {
+fn capture_mouse(message: u32, mut input: MSLLHOOKSTRUCT) {
     if STOPPED.load(Ordering::Relaxed) {
         return;
     }
     SINK.with(|sink| {
         if let Some(capture) = sink.borrow().as_ref() {
-            enqueue(&capture.sender, make_packet(Instant::now()));
+            if let Some((target, area)) = capture.window {
+                if !target.is_foreground() {
+                    STOPPED.store(true, Ordering::Relaxed);
+                    return;
+                }
+                let Some((x, y)) = area.normalize(input.pt.x, input.pt.y) else {
+                    if message != WM_MOUSEMOVE {
+                        STOPPED.store(true, Ordering::Relaxed);
+                    }
+                    return;
+                };
+                input.pt.x = x;
+                input.pt.y = y;
+            }
+            enqueue(
+                &capture.sender,
+                Packet::Mouse(Instant::now(), message, input),
+            );
         }
     });
 }
@@ -177,6 +218,13 @@ pub(super) fn keyboard(message: u32, input: KBDLLHOOKSTRUCT) {
     SINK.with(|sink| {
         let mut sink = sink.borrow_mut();
         let Some(capture) = sink.as_mut() else { return };
+        if capture
+            .window
+            .is_some_and(|(target, _)| !target.is_foreground())
+        {
+            STOPPED.store(true, Ordering::Relaxed);
+            return;
+        }
         if let Some(shortcut) = &mut capture.shortcut {
             if shortcut.handle(message, input) {
                 enqueue(
@@ -314,7 +362,7 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
             super::corner::mouse_moved(input.pt, physical);
         }
         if physical {
-            push(|at| Packet::Mouse(at, message as u32, input));
+            capture_mouse(message as u32, input);
         }
     }
     // SAFETY: передаём следующему обработчику параметры Windows без изменений.
@@ -442,7 +490,9 @@ mod tests {
     fn excludes_terminal_shortcut_modifiers_but_keeps_previous_recorded_input() {
         let (sender, receiver) = mpsc::channel();
         let start = Instant::now();
-        sender.send(Packet::Started(start)).unwrap();
+        sender
+            .send(Packet::Started(start, CoordinateSpace::Desktop))
+            .unwrap();
         for (millis, message, key) in [
             (1, WM_KEYDOWN, VK_LCONTROL),
             (2, WM_KEYDOWN, VK_ESCAPE),
@@ -537,7 +587,9 @@ mod tests {
     fn collecting_closed_input_retains_recorded_events() {
         let (sender, receiver) = mpsc::channel();
         let start = Instant::now();
-        sender.send(Packet::Started(start)).unwrap();
+        sender
+            .send(Packet::Started(start, CoordinateSpace::Desktop))
+            .unwrap();
         sender
             .send(Packet::Keyboard(
                 start + Duration::from_millis(20),

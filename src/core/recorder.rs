@@ -55,6 +55,7 @@ impl Recorder {
     pub fn finish(mut self) -> Scenario {
         self.flush_move();
         Scenario {
+            coordinates: Default::default(),
             events: self.events,
         }
     }

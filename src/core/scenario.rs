@@ -4,7 +4,27 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scenario {
+    pub coordinates: CoordinateSpace,
     pub events: Vec<TimedEvent>,
+}
+
+pub const WINDOW_COORDINATE_MAX: i32 = 1_000_000;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinateSpace {
+    #[default]
+    Desktop,
+    Window,
+}
+
+impl CoordinateSpace {
+    pub(crate) fn validate_point(self, x: i32, y: i32) -> Result<(), &'static str> {
+        let range = 0..=WINDOW_COORDINATE_MAX;
+        if self == Self::Window && !(range.contains(&x) && range.contains(&y)) {
+            return Err("Координаты окна должны быть от 0 до 1 000 000");
+        }
+        Ok(())
+    }
 }
 
 impl Scenario {
@@ -68,7 +88,7 @@ pub struct TimedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    /// Absolute physical pixels in the virtual desktop.
+    /// Физические пиксели рабочего стола или доли окна в миллионных.
     MouseMove {
         x: i32,
         y: i32,
@@ -108,6 +128,7 @@ mod tests {
     #[test]
     fn deleting_disjoint_rows_keeps_the_remaining_events_at_the_same_times() {
         let mut scenario = Scenario {
+            coordinates: Default::default(),
             events: [10, 20, 30, 40, 50, 60]
                 .into_iter()
                 .map(|delay_micros| TimedEvent {
@@ -130,6 +151,7 @@ mod tests {
     #[test]
     fn moves_rows_in_both_directions_with_their_delays() {
         let mut scenario = Scenario {
+            coordinates: Default::default(),
             events: [10, 20, 30, 40]
                 .into_iter()
                 .map(|delay_micros| TimedEvent {
@@ -154,6 +176,7 @@ mod tests {
     #[test]
     fn deleting_an_event_preserves_the_next_events_timestamp() {
         let mut scenario = Scenario {
+            coordinates: Default::default(),
             events: vec![
                 TimedEvent {
                     delay_micros: 10,
@@ -178,6 +201,7 @@ mod tests {
     #[test]
     fn deleting_an_event_leaves_scenario_intact_when_delays_overflow() {
         let original = Scenario {
+            coordinates: Default::default(),
             events: vec![
                 TimedEvent {
                     delay_micros: u64::MAX,
