@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
@@ -6,7 +7,7 @@ use super::*;
 use crate::core::recorder::Recorder;
 
 thread_local! {
-    static SINK: RefCell<Option<SyncSender<Packet>>> = const { RefCell::new(None) };
+    static SINK: RefCell<Option<CaptureSink>> = const { RefCell::new(None) };
     static LOST_EVENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -14,17 +15,25 @@ enum Packet {
     Started(Instant),
     Keyboard(Instant, u32, KBDLLHOOKSTRUCT),
     Mouse(Instant, u32, MSLLHOOKSTRUCT),
+    StopShortcut(u32),
+}
+
+struct CaptureSink {
+    sender: SyncSender<Packet>,
+    shortcut: Option<StopShortcut>,
 }
 
 pub fn record() -> io::Result<Option<Scenario>> {
     let scenario = record_with_updates(&AtomicBool::new(false), |update| match update {
         RecordingUpdate::Countdown(3) => {
             println!(
-                "Запись начнётся через 3 секунды. Переключись в тестовое окно. Остановка: Esc."
+                "Запись начнётся через 3 секунды. Для остановки вернись в консоль и нажми Ctrl+C."
             );
         }
         RecordingUpdate::Countdown(_) => {}
-        RecordingUpdate::Recording => println!("Запись началась. Нажми Esc, чтобы завершить."),
+        RecordingUpdate::Recording => {
+            println!("Запись началась. Чтобы завершить, нажми Ctrl+C в консоли.")
+        }
     })?;
     if scenario.is_none() {
         println!("Запись отменена до запуска.");
@@ -39,6 +48,14 @@ pub enum RecordingUpdate {
 
 pub fn record_with_updates(
     cancelled: &AtomicBool,
+    report: impl FnMut(RecordingUpdate) + Send,
+) -> io::Result<Option<Scenario>> {
+    record_with_shortcut(cancelled, None, report)
+}
+
+pub(crate) fn record_with_shortcut(
+    cancelled: &AtomicBool,
+    shortcut: Option<Chord>,
     mut report: impl FnMut(RecordingUpdate) + Send,
 ) -> io::Result<Option<Scenario>> {
     if cancelled.load(Ordering::Relaxed) {
@@ -52,7 +69,9 @@ pub fn record_with_updates(
     let scenario = thread::scope(|scope| -> io::Result<Option<Scenario>> {
         let worker = thread::Builder::new()
             .name("keyo-capture".into())
-            .spawn_scoped(scope, move || capture(sender, cancelled, &mut report))?;
+            .spawn_scoped(scope, move || {
+                capture(sender, cancelled, shortcut, &mut report)
+            })?;
         let scenario = collect(receiver);
         worker
             .join()
@@ -68,6 +87,7 @@ pub fn record_with_updates(
 fn collect(receiver: mpsc::Receiver<Packet>) -> Option<Scenario> {
     let mut recorder = None;
     let mut wheel = Wheel::default();
+    let mut stop_modifiers = None;
     for packet in receiver {
         match packet {
             Packet::Started(at) => {
@@ -91,17 +111,25 @@ fn collect(receiver: mpsc::Receiver<Packet>) -> Option<Scenario> {
                     }
                 }
             }
+            Packet::StopShortcut(modifiers) => stop_modifiers = Some(modifiers),
         }
     }
-    recorder.map(Recorder::finish)
+    recorder.map(|recorder| {
+        let mut scenario = recorder.finish();
+        if let Some(modifiers) = stop_modifiers {
+            remove_stop_modifiers(&mut scenario, modifiers);
+        }
+        scenario
+    })
 }
 
 fn capture(
     sender: SyncSender<Packet>,
     cancelled: &AtomicBool,
+    shortcut: Option<Chord>,
     report: &mut impl FnMut(RecordingUpdate),
 ) -> io::Result<()> {
-    let _stop = StopHook::install()?;
+    let _stop = StopHook::install(false)?;
     let _mouse = MouseHook::install()?;
     let stop = || cancelled.load(Ordering::Relaxed) || stop_requested();
     if !countdown_with(stop, wait_for_messages, |seconds| {
@@ -112,7 +140,12 @@ fn capture(
     sender
         .send(Packet::Started(Instant::now()))
         .map_err(|_| io::Error::other("Получатель событий записи недоступен"))?;
-    SINK.with(|sink| sink.replace(Some(sender)));
+    SINK.with(|sink| {
+        sink.replace(Some(CaptureSink {
+            sender,
+            shortcut: shortcut.map(StopShortcut::from_pressed_keys),
+        }))
+    });
     report(RecordingUpdate::Recording);
     while !stop() {
         wait_for_messages();
@@ -131,17 +164,114 @@ fn push(make_packet: impl FnOnce(Instant) -> Packet) {
         return;
     }
     SINK.with(|sink| {
-        if let Some(sender) = sink.borrow().as_ref() {
-            if sender.try_send(make_packet(Instant::now())).is_err() {
-                LOST_EVENTS.with(|lost| lost.set(true));
-                STOPPED.store(true, Ordering::Relaxed);
-            }
+        if let Some(capture) = sink.borrow().as_ref() {
+            enqueue(&capture.sender, make_packet(Instant::now()));
         }
     });
 }
 
 pub(super) fn keyboard(message: u32, input: KBDLLHOOKSTRUCT) {
-    push(|at| Packet::Keyboard(at, message, input));
+    if STOPPED.load(Ordering::Relaxed) {
+        return;
+    }
+    SINK.with(|sink| {
+        let mut sink = sink.borrow_mut();
+        let Some(capture) = sink.as_mut() else { return };
+        if let Some(shortcut) = &mut capture.shortcut {
+            if shortcut.handle(message, input) {
+                enqueue(
+                    &capture.sender,
+                    Packet::StopShortcut(shortcut.chord.modifiers),
+                );
+                STOPPED.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+        enqueue(
+            &capture.sender,
+            Packet::Keyboard(Instant::now(), message, input),
+        );
+    });
+}
+
+fn enqueue(sender: &SyncSender<Packet>, packet: Packet) {
+    if sender.try_send(packet).is_err() {
+        LOST_EVENTS.with(|lost| lost.set(true));
+        STOPPED.store(true, Ordering::Relaxed);
+    }
+}
+
+const MODIFIER_KEYS: [(u16, u32); 8] = [
+    (VK_LCONTROL, MOD_CONTROL),
+    (VK_RCONTROL, MOD_CONTROL),
+    (VK_LMENU, MOD_ALT),
+    (VK_RMENU, MOD_ALT),
+    (VK_LSHIFT, MOD_SHIFT),
+    (VK_RSHIFT, MOD_SHIFT),
+    (VK_LWIN, MOD_WIN),
+    (VK_RWIN, MOD_WIN),
+];
+
+struct StopShortcut {
+    chord: Chord,
+    pressed_modifiers: [bool; 8],
+    primary_down: bool,
+}
+
+impl StopShortcut {
+    fn from_pressed_keys(chord: Chord) -> Self {
+        // SAFETY: читаем состояние клавиш вне обратного вызова перехвата.
+        let is_down = |code| unsafe { GetAsyncKeyState(code) < 0 };
+        Self {
+            chord,
+            pressed_modifiers: MODIFIER_KEYS.map(|(code, _)| is_down(i32::from(code))),
+            primary_down: is_down(chord.code as i32),
+        }
+    }
+
+    fn handle(&mut self, message: u32, input: KBDLLHOOKSTRUCT) -> bool {
+        let Some(code) = capture_key_code(input) else {
+            return false;
+        };
+        let down = match message {
+            WM_KEYDOWN | WM_SYSKEYDOWN => true,
+            WM_KEYUP | WM_SYSKEYUP => false,
+            _ => return false,
+        };
+        if let Some(index) = MODIFIER_KEYS.iter().position(|&(key, _)| key == code) {
+            self.pressed_modifiers[index] = down;
+        }
+        if u32::from(code) != self.chord.code {
+            return false;
+        }
+        let fresh_press = down && !self.primary_down;
+        self.primary_down = down;
+        let modifiers = MODIFIER_KEYS.iter().zip(self.pressed_modifiers).fold(
+            0,
+            |mask, ((_, flag), pressed)| if pressed { mask | flag } else { mask },
+        );
+        fresh_press && modifiers == self.chord.modifiers
+    }
+}
+
+fn remove_stop_modifiers(scenario: &mut Scenario, modifiers: u32) {
+    let mut remove = BTreeSet::new();
+    for (index, timed) in scenario.events.iter().enumerate().rev() {
+        match &timed.event {
+            Event::MouseMove { .. } => {}
+            Event::KeyDown { key }
+                if keyboard_code(key).is_ok_and(|(code, _)| {
+                    MODIFIER_KEYS
+                        .iter()
+                        .any(|&(modifier, flag)| modifier == code && modifiers & flag != 0)
+                }) =>
+            {
+                remove.insert(index);
+            }
+            _ => break,
+        }
+    }
+    scenario.remove_events(&remove);
 }
 
 pub(super) fn is_physical_keyboard(flags: u32) -> bool {
@@ -187,10 +317,9 @@ unsafe extern "system" fn mouse_hook(code: i32, message: WPARAM, data: LPARAM) -
     unsafe { CallNextHookEx(null_mut(), code, message, data) }
 }
 
-fn keyboard_event(message: u32, input: KBDLLHOOKSTRUCT) -> Option<Event> {
+fn capture_key_code(input: KBDLLHOOKSTRUCT) -> Option<u16> {
     let extended = input.flags & LLKHF_EXTENDED != 0;
-    let code = match u16::try_from(input.vkCode).ok()? {
-        VK_ESCAPE => return None,
+    Some(match u16::try_from(input.vkCode).ok()? {
         VK_SHIFT if input.scanCode == 0x36 => VK_RSHIFT,
         VK_SHIFT => VK_LSHIFT,
         VK_CONTROL if extended => VK_RCONTROL,
@@ -198,7 +327,12 @@ fn keyboard_event(message: u32, input: KBDLLHOOKSTRUCT) -> Option<Event> {
         VK_MENU if extended => VK_RMENU,
         VK_MENU => VK_LMENU,
         code => code,
-    };
+    })
+}
+
+fn keyboard_event(message: u32, input: KBDLLHOOKSTRUCT) -> Option<Event> {
+    let extended = input.flags & LLKHF_EXTENDED != 0;
+    let code = capture_key_code(input)?;
     let key = match u8::try_from(code).ok()? {
         character @ (b'A'..=b'Z' | b'0'..=b'9') => char::from(character).to_string(),
         _ if code == VK_RETURN && extended => "NumpadEnter".into(),
@@ -275,6 +409,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configured_win_shortcut_stops_only_on_a_fresh_press_with_matching_modifiers() {
+        let mut shortcut = StopShortcut {
+            chord: Chord {
+                modifiers: MOD_WIN | MOD_SHIFT,
+                code: u32::from(b'K'),
+            },
+            pressed_modifiers: [false; 8],
+            primary_down: true,
+        };
+        let key = |vk: u32| KBDLLHOOKSTRUCT {
+            vkCode: vk,
+            ..Default::default()
+        };
+        assert!(!shortcut.handle(WM_KEYDOWN, key(u32::from(VK_ESCAPE))));
+        assert!(!shortcut.handle(WM_KEYDOWN, key(u32::from(VK_RWIN))));
+        assert!(!shortcut.handle(WM_KEYDOWN, key(u32::from(VK_SHIFT))));
+        assert!(!shortcut.handle(WM_KEYDOWN, key(u32::from(b'K'))));
+        assert!(!shortcut.handle(WM_KEYUP, key(u32::from(b'K'))));
+        assert!(!shortcut.handle(WM_KEYDOWN, key(u32::from(VK_RCONTROL))));
+        assert!(!shortcut.handle(WM_KEYDOWN, key(u32::from(b'K'))));
+        assert!(!shortcut.handle(WM_KEYUP, key(u32::from(b'K'))));
+        assert!(!shortcut.handle(WM_KEYUP, key(u32::from(VK_RCONTROL))));
+        assert!(shortcut.handle(WM_KEYDOWN, key(u32::from(b'K'))));
+    }
+
+    #[test]
+    fn excludes_terminal_shortcut_modifiers_but_keeps_previous_recorded_input() {
+        let (sender, receiver) = mpsc::channel();
+        let start = Instant::now();
+        sender.send(Packet::Started(start)).unwrap();
+        for (millis, message, key) in [
+            (1, WM_KEYDOWN, VK_LCONTROL),
+            (2, WM_KEYDOWN, VK_ESCAPE),
+            (3, WM_KEYUP, VK_ESCAPE),
+            (4, WM_KEYUP, VK_LCONTROL),
+            (5, WM_KEYDOWN, VK_RWIN),
+            (6, WM_KEYDOWN, VK_LSHIFT),
+        ] {
+            sender
+                .send(Packet::Keyboard(
+                    start + Duration::from_millis(millis),
+                    message,
+                    KBDLLHOOKSTRUCT {
+                        vkCode: u32::from(key),
+                        ..Default::default()
+                    },
+                ))
+                .unwrap();
+        }
+        sender
+            .send(Packet::StopShortcut(MOD_WIN | MOD_SHIFT))
+            .unwrap();
+        drop(sender);
+        let keys: Vec<_> = collect(receiver)
+            .unwrap()
+            .events
+            .into_iter()
+            .map(|timed| (timed.delay_micros, timed.event))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (
+                    1000,
+                    Event::KeyDown {
+                        key: "ControlLeft".into()
+                    }
+                ),
+                (
+                    1000,
+                    Event::KeyDown {
+                        key: "Escape".into()
+                    }
+                ),
+                (
+                    1000,
+                    Event::KeyUp {
+                        key: "Escape".into()
+                    }
+                ),
+                (
+                    1000,
+                    Event::KeyUp {
+                        key: "ControlLeft".into()
+                    }
+                ),
+            ]
+        );
+    }
+    #[test]
     fn capture_distinguishes_numeric_keypad_enter_and_supports_function_keys() {
         for (code, flags, name) in [
             (VK_RETURN, 0, "Enter"),
@@ -336,12 +560,23 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_capture_uses_playback_identifiers_and_skips_escape() {
+    fn keyboard_capture_records_escape_and_uses_playback_identifiers() {
         let escape = KBDLLHOOKSTRUCT {
             vkCode: u32::from(VK_ESCAPE),
             ..Default::default()
         };
-        assert_eq!(keyboard_event(WM_KEYDOWN, escape), None);
+        assert_eq!(
+            keyboard_event(WM_KEYDOWN, escape),
+            Some(Event::KeyDown {
+                key: "Escape".into()
+            })
+        );
+        assert_eq!(
+            keyboard_event(WM_KEYUP, escape),
+            Some(Event::KeyUp {
+                key: "Escape".into()
+            })
+        );
         let control = KBDLLHOOKSTRUCT {
             vkCode: u32::from(VK_CONTROL),
             flags: LLKHF_EXTENDED,

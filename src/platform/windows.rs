@@ -22,10 +22,24 @@ use crate::core::player::{self, PlaybackOptions, PlaybackOutcome, PlaybackPass};
 use crate::core::scenario::{Event, MouseButton, Scenario};
 
 mod capture;
+#[cfg(feature = "gui")]
+pub(crate) mod hotkeys;
+#[cfg(feature = "gui")]
+pub(crate) use capture::record_with_shortcut;
 pub use capture::{record, record_with_updates, RecordingUpdate};
 
 static STOPPED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static ESCAPE_STOPS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Chord {
+    modifiers: u32,
+    code: u32,
+}
 
 pub enum PlaybackUpdate {
     Countdown(u8),
@@ -87,7 +101,7 @@ pub fn play_with_updates(
         return Ok(PlaybackOutcome::Completed);
     }
 
-    let _stop = StopHook::install()?;
+    let _stop = StopHook::install(true)?;
     let stop = || cancelled.load(Ordering::Relaxed) || stop_requested();
     if !countdown_with(stop, wait_for_messages, |seconds| {
         report(PlaybackUpdate::Countdown(seconds));
@@ -468,8 +482,9 @@ struct StopHook {
 }
 
 impl StopHook {
-    fn install() -> io::Result<Self> {
+    fn install(escape_stops: bool) -> io::Result<Self> {
         STOPPED.store(false, Ordering::Relaxed);
+        ESCAPE_STOPS.with(|mode| mode.set(escape_stops));
         // SAFETY: обе функции получают статические обработчики с ABI Windows.
         unsafe {
             let module = GetModuleHandleW(std::ptr::null());
@@ -505,7 +520,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
         // SAFETY: для HC_ACTION Windows передаёт указатель на KBDLLHOOKSTRUCT.
         let event = unsafe { &*(data as *const KBDLLHOOKSTRUCT) };
         if capture::is_physical_keyboard(event.flags) {
-            if event.vkCode == u32::from(VK_ESCAPE) {
+            if event.vkCode == u32::from(VK_ESCAPE) && ESCAPE_STOPS.with(std::cell::Cell::get) {
                 if matches!(message as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
                     STOPPED.store(true, Ordering::Relaxed);
                 }

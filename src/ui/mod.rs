@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, FontData, FontDefinitions, FontFamily, RichText, Theme};
 use windows_sys::Win32::UI::Controls::Dialogs::{
@@ -22,14 +22,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::core::player::{PlaybackOptions, PlaybackOutcome, PlaybackPass, RepeatMode};
 use crate::core::scenario::Scenario;
+use crate::platform::windows::hotkeys::{
+    Action as HotkeyAction, HotkeyEvent, HotkeyService, HotkeySettings,
+};
 use crate::platform::windows::{
-    play_with_updates, record_with_updates, validate_playback, PlaybackUpdate, RecordingUpdate,
+    play_with_updates, record_with_shortcut, validate_playback, PlaybackUpdate, RecordingUpdate,
 };
 use crate::storage::{read_json, write_json_new, write_json_replace};
 
 mod editor;
 mod placement;
 mod recent;
+mod settings;
 use editor::{Editor, EditorAction};
 use placement::{RestorePlacement, WindowSettings};
 use recent::RecentScenarios;
@@ -39,6 +43,8 @@ const WINDOW_SIZE: [f32; 2] = [620.0, 590.0];
 pub fn run() -> eframe::Result {
     let recent = RecentScenarios::load();
     let windows = WindowSettings::load();
+    let hotkey_file = profile_file("hotkeys.json");
+    let hotkey_settings = settings::load(hotkey_file.as_deref());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(WINDOW_SIZE)
@@ -51,9 +57,24 @@ pub fn run() -> eframe::Result {
         options,
         Box::new(move |context| {
             configure_style(&context.egui_ctx);
+            let wake = context.egui_ctx.clone();
+            let (hotkeys, hotkey_error) = match HotkeyService::start(
+                hotkey_settings.clone(),
+                move |settings| settings::save(hotkey_file.as_deref(), settings),
+                move || wake.request_repaint_of(egui::ViewportId::ROOT),
+            ) {
+                Ok(service) => (Some(service), None),
+                Err(error) => (
+                    None,
+                    Some(format!("Не удалось запустить горячие клавиши. {error}")),
+                ),
+            };
             Ok(Box::new(MainWindow {
                 recent,
                 windows,
+                hotkeys,
+                hotkey_settings,
+                hotkey_error,
                 ..Default::default()
             }))
         }),
@@ -181,6 +202,11 @@ struct MainWindow {
     recent_error: Option<String>,
     windows: WindowSettings,
     restore_main: RestorePlacement,
+    hotkeys: Option<HotkeyService>,
+    hotkey_settings: HotkeySettings,
+    hotkey_error: Option<String>,
+    settings_dialog: Option<settings::SettingsDialog>,
+    hotkeys_resume_at: Option<Instant>,
 }
 
 enum CloseDecision {
@@ -217,6 +243,85 @@ fn close_dialog(context: &egui::Context, message: &str, can_save: bool) -> Optio
 }
 
 impl MainWindow {
+    fn poll_hotkeys(&mut self, context: &egui::Context) {
+        while let Some(event) = self
+            .hotkeys
+            .as_ref()
+            .and_then(|service| service.events.try_recv().ok())
+        {
+            match event {
+                HotkeyEvent::Triggered(action) => {
+                    if action == HotkeyAction::Record
+                        && self.recording_active()
+                        && matches!(self.status, Status::Preparing | Status::Countdown(_))
+                    {
+                        self.stop();
+                        continue;
+                    }
+                    let available = self.job.is_none()
+                        && self.settings_dialog.is_none()
+                        && self.editor.is_none()
+                        && !self.close_prompt
+                        && !self.closing
+                        && self
+                            .hotkeys_resume_at
+                            .is_none_or(|when| Instant::now() >= when);
+                    if !available {
+                        continue;
+                    }
+                    match action {
+                        HotkeyAction::Record if self.can_open() => self.record(context),
+                        HotkeyAction::Play if self.can_play() => self.play(context),
+                        _ => {}
+                    }
+                }
+                HotkeyEvent::StartupError(error) => self.hotkey_error = Some(error),
+                HotkeyEvent::Applied(Ok(settings)) => {
+                    self.hotkey_settings = settings;
+                    self.settings_dialog = None;
+                    self.hotkey_error = None;
+                    self.hotkeys_resume_at = Some(Instant::now() + Duration::from_millis(60));
+                }
+                HotkeyEvent::Applied(Err(error)) => {
+                    self.hotkey_error = Some(error.to_string());
+                    if let Some(dialog) = &mut self.settings_dialog {
+                        dialog.applying = false;
+                    }
+                }
+            }
+        }
+    }
+
+    fn can_play(&self) -> bool {
+        self.job.is_none()
+            && self.pending_recording.is_none()
+            && self
+                .loaded
+                .as_ref()
+                .is_some_and(|loaded| !loaded.scenario.events.is_empty())
+    }
+
+    fn show_settings(&mut self, context: &egui::Context) {
+        let Some(dialog) = &mut self.settings_dialog else {
+            return;
+        };
+        match dialog.show(context, self.hotkey_error.as_deref()) {
+            Some(settings::Choice::Apply) => {
+                let result = self
+                    .hotkeys
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("Служба горячих клавиш недоступна"))
+                    .and_then(|service| service.apply(dialog.draft.clone()));
+                match result {
+                    Ok(()) => dialog.applying = true,
+                    Err(error) => self.hotkey_error = Some(error.to_string()),
+                }
+            }
+            Some(settings::Choice::Cancel) => self.settings_dialog = None,
+            None => {}
+        }
+    }
+
     fn can_open(&self) -> bool {
         self.job.is_none() && self.pending_recording.is_none() && self.original.is_none()
     }
@@ -266,8 +371,9 @@ impl MainWindow {
         self.dialog_owner = unsafe { GetActiveWindow() } as isize;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let shortcut = self.hotkey_settings.recording_shortcut();
         self.start_job(context, Some(stop), true, Status::Preparing, move |send| {
-            let result = record_with_updates(&worker_stop, |update| {
+            let result = record_with_shortcut(&worker_stop, shortcut, |update| {
                 send(Message::Progress(match update {
                     RecordingUpdate::Countdown(seconds) => Status::Countdown(seconds),
                     RecordingUpdate::Recording => Status::Recording,
@@ -489,7 +595,12 @@ impl MainWindow {
 impl eframe::App for MainWindow {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.windows.main.update(ctx, &mut self.restore_main, false);
+        self.poll_hotkeys(ctx);
+        let input_was_active = self.input_active();
         self.poll_messages();
+        if input_was_active && !self.input_active() {
+            self.hotkeys_resume_at = Some(Instant::now() + Duration::from_millis(60));
+        }
         if ctx.input(|input| input.viewport().close_requested()) {
             self.handle_close_request(ctx);
         }
@@ -504,7 +615,7 @@ impl eframe::App for MainWindow {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        if !self.recording_active() && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.stop();
         }
         if matches!(self.status, Status::RecordingReady) && !self.close_prompt {
@@ -514,7 +625,13 @@ impl eframe::App for MainWindow {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
-        ui.add_enabled_ui(self.editor.is_none(), |ui| self.draw(ui));
+        ui.add_enabled_ui(
+            self.editor.is_none() && self.settings_dialog.is_none(),
+            |ui| self.draw(ui),
+        );
+        if self.settings_dialog.is_some() && !self.close_prompt {
+            self.show_settings(&context);
+        }
         let file_name = self.loaded.as_ref().map(|loaded| loaded.name.as_str());
         if self.close_prompt {
             let can_save = self.job.is_none() && self.editor.as_ref().is_none_or(Editor::can_apply);
@@ -604,6 +721,25 @@ impl MainWindow {
                 egui::vec2(ui.available_width(), 36.0),
                 egui::Layout::right_to_left(Align::Center),
                 |ui| {
+                    if self.pending_recording.is_none()
+                        && self.original.is_none()
+                        && action_button(
+                            ui,
+                            self.job.is_none(),
+                            ActionIcon::Settings,
+                            "",
+                            surface,
+                            ui.visuals().text_color(),
+                            36.0,
+                        )
+                        .on_hover_text("Настройки")
+                        .clicked()
+                    {
+                        self.settings_dialog = Some(settings::SettingsDialog {
+                            draft: self.hotkey_settings.clone(),
+                            applying: false,
+                        });
+                    }
                     if self.pending_recording.is_some() {
                         if ui
                             .add_enabled(self.job.is_none(), egui::Button::new("Сохранить JSON"))
@@ -653,9 +789,8 @@ impl MainWindow {
                     } else {
                         (ActionIcon::Play, "Воспроизвести", green)
                     };
-                    let enabled = (active
-                        && !matches!(self.status, Status::Stopping | Status::Recording))
-                        || (self.job.is_none() && self.pending_recording.is_none() && has_events);
+                    let enabled =
+                        (active && !matches!(self.status, Status::Stopping)) || self.can_play();
                     if action_button(ui, enabled, icon, label, fill, button_text, 140.0).clicked() {
                         if active {
                             self.stop();
@@ -759,10 +894,14 @@ impl MainWindow {
                 }
             }
             if active {
-                let hint = if matches!(self.status, Status::Countdown(_)) {
+                let hint = if self.recording_active() {
+                    if self.hotkey_settings.recording_shortcut().is_some() {
+                        "Для остановки повтори сочетание записи или нажми «Стоп»"
+                    } else {
+                        "Нажми «Стоп», чтобы завершить запись"
+                    }
+                } else if matches!(self.status, Status::Countdown(_)) {
                     "Переключись в тестовое окно. Esc — остановить"
-                } else if matches!(self.status, Status::Recording) {
-                    "Esc — завершить запись"
                 } else {
                     "Esc — остановить"
                 };
@@ -834,6 +973,7 @@ enum ActionIcon {
     Play,
     Record,
     Stop,
+    Settings,
 }
 
 fn action_button(
@@ -847,10 +987,12 @@ fn action_button(
 ) -> egui::Response {
     ui.add_enabled_ui(enabled, |ui| {
         let icon_id = egui::IdSalt::new("action-icon");
-        let button = egui::Button::new((
-            egui::Atom::custom(icon_id, egui::vec2(14.0, 14.0)),
-            RichText::new(label).color(foreground),
-        ))
+        let atom = egui::Atom::custom(icon_id, egui::vec2(16.0, 16.0));
+        let button = if matches!(icon, ActionIcon::Settings) {
+            egui::Button::new(atom)
+        } else {
+            egui::Button::new((atom, RichText::new(label).color(foreground)))
+        }
         .gap(7.0)
         .min_size(egui::vec2(width, 36.0))
         .corner_radius(6)
@@ -881,7 +1023,24 @@ fn action_button(
                         foreground,
                     );
                 }
+                ActionIcon::Settings => {
+                    let teeth = (0..32)
+                        .map(|step| {
+                            let angle = step as f32 * std::f32::consts::TAU / 32.0;
+                            let radius = if matches!(step % 4, 1 | 2) { 7.0 } else { 5.4 };
+                            center + egui::vec2(angle.cos(), angle.sin()) * radius
+                        })
+                        .collect();
+                    let stroke = egui::Stroke::new(1.4, foreground);
+                    painter.add(egui::Shape::closed_line(teeth, stroke));
+                    painter.circle_stroke(center, 2.3, stroke);
+                }
             }
+        }
+        if matches!(icon, ActionIcon::Settings) {
+            button.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, enabled, "Настройки")
+            });
         }
         button.response
     })
@@ -1425,6 +1584,11 @@ mod tests {
             let record = text_bounds("Записать");
             assert!(playback.right() < record.left());
             assert!((playback.center().y - record.center().y).abs() < 2.0);
+            assert!(output.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::epaint::Shape::Path(gear)
+                    if gear.points.len() == 32 && gear.visual_bounding_rect().left() > record.right()
+                    && (gear.visual_bounding_rect().center().y - record.center().y).abs() < 3.0)
+            }));
             assert!(output.shapes.iter().any(|clipped| {
                 let bounds = match &clipped.shape {
                     egui::epaint::Shape::Path(shape) if !running && shape.points.len() == 3 => {
