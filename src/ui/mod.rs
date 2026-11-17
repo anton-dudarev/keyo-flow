@@ -419,8 +419,7 @@ impl MainWindow {
     fn record(&mut self, context: &egui::Context) {
         let target = if self.record_relative {
             let Some(window) = &self.playback_target else {
-                self.status =
-                    Status::Error("Для записи координат окна выбери тестовое окно".into());
+                self.status = Status::Error("Для записи координат окна выбери целевое окно".into());
                 return;
             };
             Some(window.target)
@@ -931,9 +930,7 @@ impl MainWindow {
                                     .color(weak),
                                 );
                                 if loaded.scenario.coordinates == CoordinateSpace::Window {
-                                    ui.label(
-                                        RichText::new("Координаты тестового окна").color(weak),
-                                    );
+                                    ui.label(RichText::new("Координаты целевого окна").color(weak));
                                 }
                             });
                         } else {
@@ -993,13 +990,13 @@ impl MainWindow {
                         "Нажми «Стоп», чтобы завершить запись"
                     }
                 } else if matches!(self.status, Status::Countdown(_)) {
-                    "Переключись в тестовое окно. Остановка: Esc или верхний левый угол"
+                    "Переключись в целевое окно. Остановка: Esc или верхний левый угол"
                 } else {
                     "Остановка: Esc или верхний левый угол основного монитора"
                 };
                 ui.label(RichText::new(hint).color(weak));
             } else if has_events && matches!(self.status, Status::Ready | Status::Saved) {
-                ui.label(RichText::new("После запуска переключись в тестовое окно.").color(weak));
+                ui.label(RichText::new("После запуска переключись в целевое окно.").color(weak));
             }
             if let Some(fraction) = self.progress(&context) {
                 ui.add_space(12.0);
@@ -1022,7 +1019,7 @@ impl MainWindow {
         let mut pick = false;
         let mut changed = false;
         ui.horizontal(|ui| {
-            let label = ui.label("Тестовое окно");
+            let label = ui.label("Целевое окно");
             let selected = self.playback_target.as_ref();
             egui::ComboBox::from_id_salt("playback_target")
                 .selected_text(selected.map_or("Любое активное окно", |window| {
@@ -1267,10 +1264,10 @@ impl MainWindow {
             }
             Status::Countdown(seconds) => format!("Запуск через {seconds} с"),
             Status::SelectingWindow(seconds) => {
-                format!("Переключись в тестовое окно. Выбор через {seconds} с")
+                format!("Переключись в целевое окно. Выбор через {seconds} с")
             }
-            Status::WindowSelected => "Тестовое окно выбрано".into(),
-            Status::WindowSelectionCancelled => "Выбор тестового окна отменён".into(),
+            Status::WindowSelected => "Целевое окно выбрано".into(),
+            Status::WindowSelectionCancelled => "Выбор целевого окна отменён".into(),
             Status::Playing(pass) => {
                 let (label, detail) = self.playback_labels(*pass);
                 match detail {

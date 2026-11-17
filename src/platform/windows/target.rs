@@ -96,7 +96,7 @@ impl PlaybackTarget {
         }
         if self.client_area()?.normalize(point.x, point.y).is_none() {
             return Err(super::invalid(
-                "Курсор находится за пределами тестового окна",
+                "Курсор находится за пределами целевого окна",
             ));
         }
         Ok(())
@@ -111,11 +111,11 @@ impl PlaybackTarget {
             GetClientRect(window, &mut rect) == 0 || ClientToScreen(window, &mut origin) == 0
         } {
             return Err(super::os_error(
-                "Не удалось получить клиентскую область тестового окна",
+                "Не удалось получить клиентскую область целевого окна",
             ));
         }
         if rect.right <= 0 || rect.bottom <= 0 {
-            return Err(super::invalid("Клиентская область тестового окна пуста"));
+            return Err(super::invalid("Клиентская область целевого окна пуста"));
         }
         Ok(ClientArea {
             x: origin.x,
@@ -131,10 +131,10 @@ impl PlaybackTarget {
         // SAFETY: Win32 проверяет дескриптор и записывает идентификатор в локальную переменную.
         let thread = unsafe { GetWindowThreadProcessId(window, &mut process) };
         if thread != self.thread || process != self.process {
-            return Err(io::Error::other("Выбранное тестовое окно было закрыто"));
+            return Err(io::Error::other("Выбранное целевое окно было закрыто"));
         }
         if !self.is_foreground() {
-            return Err(io::Error::other("Выбранное тестовое окно не активно"));
+            return Err(io::Error::other("Выбранное целевое окно не активно"));
         }
         Ok(())
     }

@@ -104,7 +104,7 @@ pub(crate) fn play_with_target(
     let window_coordinates = match scenario.coordinates {
         CoordinateSpace::Desktop => None,
         CoordinateSpace::Window => Some(target.ok_or_else(|| invalid(
-            "Сценарий использует координаты окна. Выбери тестовое окно в графическом интерфейсе Keyo",
+            "Сценарий использует координаты окна. Выбери целевое окно в графическом интерфейсе Keyo",
         ))?),
     };
     let _active = ACTIVE
@@ -532,7 +532,7 @@ impl Inputs {
             unsafe { SendInput(self.count, self.values.as_ptr(), size_of::<INPUT>() as i32) };
         if sent != self.count {
             return Err(os_error(
-                "Windows не приняла все события ввода (проверьте, запущено ли тестируемое окно от имени администратора)",
+                "Windows не приняла все события ввода (проверьте, запущено ли целевое окно от имени администратора)",
             ));
         }
         Ok(())
