@@ -48,10 +48,11 @@ impl PlaybackOptions {
                 "Пустой сценарий нельзя повторять бесконечно",
             ));
         }
+        scenario.validate_motion()?;
         let total = scenario
             .events
             .iter()
-            .map(|event| u128::from(event.delay_micros))
+            .map(|event| u128::from(event.delay_micros) + u128::from(event.event.duration_micros()))
             .sum();
         target_time(Instant::now(), total, self.speed)?;
         Ok(())
@@ -173,16 +174,34 @@ fn run(
             started_at: start,
         });
         let mut elapsed_micros = 0;
+        let mut position = None;
         let mut input = PressedInputGuard::new(send);
+        let mut send_at = |elapsed, event: &Event| -> io::Result<bool> {
+            let deadline = target_time(start, elapsed, options.speed)?;
+            if !wait_until(deadline, stopped) {
+                return Ok(false);
+            }
+            before_event(event)?;
+            input.send(event)?;
+            Ok(true)
+        };
         for timed in &scenario.events {
             elapsed_micros += u128::from(timed.delay_micros);
-            let deadline = target_time(start, elapsed_micros, options.speed)?;
-            if !wait_until(deadline, stopped) {
+            if let Event::MouseMoveSmooth { x, y, .. } = timed.event {
+                let from = position.expect("Перед плавным перемещением проверена начальная точка");
+                let duration = timed.event.duration_micros();
+                for (offset, event) in smooth_steps(from, (x, y), duration) {
+                    if !send_at(elapsed_micros + u128::from(offset), &event)? {
+                        input.release_all()?;
+                        return Ok(PlaybackOutcome::Stopped);
+                    }
+                }
+                elapsed_micros += u128::from(duration);
+            } else if !send_at(elapsed_micros, &timed.event)? {
                 input.release_all()?;
                 return Ok(PlaybackOutcome::Stopped);
             }
-            before_event(&timed.event)?;
-            input.send(&timed.event)?;
+            position = timed.event.pointer_position().or(position);
         }
         input.release_all()?;
         if matches!(options.repeats, RepeatMode::Count(count) if number == u64::from(count)) {
@@ -193,6 +212,30 @@ fn run(
         }
     }
     Ok(PlaybackOutcome::Stopped)
+}
+
+fn smooth_steps(
+    from: (i32, i32),
+    to: (i32, i32),
+    duration: u64,
+) -> impl Iterator<Item = (u64, Event)> {
+    // shortcut: длинный путь ограничен 600 шагами, пересмотри лимит при необходимости более частых шагов.
+    let steps = duration.div_ceil(16_000).min(600);
+    (1..=steps).map(move |step| {
+        let t = step as f64 / steps as f64;
+        let fraction = t * t * (3.0 - 2.0 * t);
+        let interpolate = |start, end| {
+            let start = f64::from(start);
+            (start + (f64::from(end) - start) * fraction).round() as i32
+        };
+        (
+            duration * step / steps,
+            Event::MouseMove {
+                x: interpolate(from.0, to.0),
+                y: interpolate(from.1, to.1),
+            },
+        )
+    })
 }
 
 fn target_time(start: Instant, elapsed_micros: u128, speed: f64) -> io::Result<Instant> {
@@ -222,6 +265,66 @@ fn wait_until(deadline: Instant, stopped: &AtomicBool) -> bool {
 mod tests {
     use super::*;
     use crate::core::scenario::TimedEvent;
+
+    #[test]
+    fn smooth_move_plays_intermediate_points_and_reaches_the_destination() {
+        let move_to = |x, y| Event::MouseMove { x, y };
+        let expected = [
+            move_to(-69, 23),
+            move_to(0, 30),
+            move_to(69, 37),
+            move_to(100, 40),
+        ];
+        let steps: Vec<_> = smooth_steps((-100, 20), (100, 40), 64_000).collect();
+        assert_eq!(
+            steps,
+            [16_000, 32_000, 48_000, 64_000]
+                .into_iter()
+                .zip(expected.clone())
+                .collect::<Vec<_>>()
+        );
+        let first = TimedEvent {
+            delay_micros: 0,
+            event: move_to(-100, 20),
+        };
+        let smooth = TimedEvent {
+            delay_micros: 500,
+            event: Event::MouseMoveSmooth {
+                x: 100,
+                y: 40,
+                duration_ms: 64.try_into().unwrap(),
+            },
+        };
+        let (sender, receiver) = mpsc::channel();
+        let playback = play(
+            Scenario {
+                coordinates: Default::default(),
+                events: vec![first, smooth],
+            },
+            100.0,
+            1,
+            move |event| {
+                sender.send(event.clone()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            playback
+                .result
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap(),
+            PlaybackOutcome::Completed
+        );
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<_>>(),
+            [move_to(-100, 20)]
+                .into_iter()
+                .chain(expected)
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn losing_target_focus_releases_held_input_without_sending_the_next_event() {

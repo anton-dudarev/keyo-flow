@@ -114,7 +114,9 @@ impl Loaded {
 
     fn duration_of(scenario: &Scenario) -> Duration {
         scenario.events.iter().fold(Duration::ZERO, |total, event| {
-            total.saturating_add(Duration::from_micros(event.delay_micros))
+            total
+                .saturating_add(Duration::from_micros(event.delay_micros))
+                .saturating_add(Duration::from_micros(event.event.duration_micros()))
         })
     }
 }

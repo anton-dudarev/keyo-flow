@@ -2,6 +2,18 @@ use crate::core::scenario::{Event, MouseButton, Scenario, TimedEvent};
 use crate::storage::{read_json, write_json};
 
 #[test]
+fn smooth_move_round_trips_as_one_event_and_preserves_time_when_deleted() {
+    let json = br#"{"version":2,"events":[{"delay_micros":0,"event":{"type":"mouse_move","x":0,"y":0}},{"delay_micros":20000,"event":{"type":"mouse_move_smooth","x":110,"y":74,"duration_ms":300}},{"delay_micros":50000,"event":{"type":"key_up","key":"A"}}]}"#;
+    let mut scenario = read_json(json.as_slice()).unwrap();
+    assert_eq!(scenario.events.len(), 3);
+    let mut output = Vec::new();
+    write_json(&mut output, &scenario).unwrap();
+    assert_eq!(read_json(output.as_slice()).unwrap(), scenario);
+    assert!(scenario.remove_event(1));
+    assert_eq!(scenario.events[1].delay_micros, 370_000);
+}
+
+#[test]
 fn recorded_scenario_round_trips_without_overwriting_existing_file() {
     use crate::storage::write_json_new;
     use std::{fs, io};

@@ -224,6 +224,7 @@ pub fn enable_dpi_awareness() -> io::Result<()> {
 }
 
 fn validate(scenario: &Scenario, desktop: Desktop) -> io::Result<()> {
+    scenario.validate_motion()?;
     let mut duration = Duration::ZERO;
     let start = Instant::now();
     for (index, timed) in scenario.events.iter().enumerate() {
@@ -232,6 +233,9 @@ fn validate(scenario: &Scenario, desktop: Desktop) -> io::Result<()> {
         })?;
         duration = duration
             .checked_add(Duration::from_micros(timed.delay_micros))
+            .and_then(|elapsed| {
+                elapsed.checked_add(Duration::from_micros(timed.event.duration_micros()))
+            })
             .ok_or_else(|| invalid("Длительность сценария слишком велика"))?;
         if start.checked_add(duration).is_none() {
             return Err(invalid("Длительность сценария слишком велика"));
@@ -264,7 +268,7 @@ impl Desktop {
 
     fn convert(self, event: &Event) -> io::Result<Inputs> {
         let (first, second) = match event {
-            Event::MouseMove { x, y } => (
+            Event::MouseMove { x, y } | Event::MouseMoveSmooth { x, y, .. } => (
                 mouse(
                     normalize(*x, self.x, self.width)?,
                     normalize(*y, self.y, self.height)?,
@@ -489,8 +493,8 @@ fn validate_in_space(
     coordinates: CoordinateSpace,
     event: &Event,
 ) -> io::Result<()> {
-    if let (CoordinateSpace::Window, Event::MouseMove { x, y }) = (coordinates, event) {
-        return coordinates.validate_point(*x, *y).map_err(invalid);
+    if let (CoordinateSpace::Window, Some((x, y))) = (coordinates, event.pointer_position()) {
+        return coordinates.validate_point(x, y).map_err(invalid);
     }
     desktop.convert(event).map(|_| ())
 }

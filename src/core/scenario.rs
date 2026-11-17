@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +29,23 @@ impl CoordinateSpace {
 }
 
 impl Scenario {
+    pub(crate) fn validate_motion(&self) -> std::io::Result<()> {
+        let mut has_position = false;
+        for (index, timed) in self.events.iter().enumerate() {
+            if matches!(timed.event, Event::MouseMoveSmooth { .. }) && !has_position {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Событие {}: перед плавным перемещением нужна начальная точка курсора",
+                        index + 1
+                    ),
+                ));
+            }
+            has_position |= timed.event.pointer_position().is_some();
+        }
+        Ok(())
+    }
+
     /// Перемещает событие вместе с задержкой к границе между исходными строками.
     pub fn move_event(&mut self, from: usize, boundary: usize) -> Option<usize> {
         if from >= self.events.len() || boundary > self.events.len() {
@@ -56,6 +74,7 @@ impl Scenario {
         for (index, event) in self.events.iter().enumerate() {
             delay += u128::from(event.delay_micros);
             if indices.contains(&index) {
+                delay += u128::from(event.event.duration_micros());
                 continue;
             }
             if delay > u128::from(u64::MAX) {
@@ -72,6 +91,8 @@ impl Scenario {
             if keep {
                 event.delay_micros = delay as u64;
                 delay = 0;
+            } else {
+                delay += u128::from(event.event.duration_micros());
             }
             keep
         });
@@ -93,6 +114,11 @@ pub enum Event {
         x: i32,
         y: i32,
     },
+    MouseMoveSmooth {
+        x: i32,
+        y: i32,
+        duration_ms: NonZeroU32,
+    },
     MouseDown {
         button: MouseButton,
     },
@@ -110,6 +136,22 @@ pub enum Event {
     KeyUp {
         key: String,
     },
+}
+
+impl Event {
+    pub(crate) fn pointer_position(&self) -> Option<(i32, i32)> {
+        match *self {
+            Self::MouseMove { x, y } | Self::MouseMoveSmooth { x, y, .. } => Some((x, y)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn duration_micros(&self) -> u64 {
+        match *self {
+            Self::MouseMoveSmooth { duration_ms, .. } => u64::from(duration_ms.get()) * 1000,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

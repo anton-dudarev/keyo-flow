@@ -136,7 +136,21 @@ impl Editor {
     }
 
     fn apply_position(&mut self, event: TimedEvent) {
+        let index = self
+            .form
+            .as_ref()
+            .and_then(|form| form.replace)
+            .unwrap_or_else(|| (self.selected + 1).min(self.scenario.events.len()));
+        if matches!(event.event, Event::MouseMoveSmooth { .. })
+            && !self.scenario.events[..index]
+                .iter()
+                .any(|timed| timed.event.pointer_position().is_some())
+        {
+            self.error = Some("Добавь перемещение к начальной точке перед этой позицией.".into());
+            return;
+        }
         let form = self.form.take().unwrap();
+        self.error = None;
         if let Some(index) = form.replace {
             let previous = &mut self.scenario.events[index];
             self.changed |= *previous != event;
@@ -495,6 +509,7 @@ struct PositionFields {
     key_search: String,
     key_picker_open: bool,
     delay: String,
+    smooth_duration_ms: Option<u32>,
 }
 
 impl Default for PositionFields {
@@ -508,6 +523,7 @@ impl Default for PositionFields {
             key_search: String::new(),
             key_picker_open: false,
             delay: "0".into(),
+            smooth_duration_ms: None,
         }
     }
 }
@@ -519,7 +535,10 @@ impl PositionFields {
             ..Self::default()
         };
         position.kind = match &timed.event {
-            Event::MouseMove { x, y } => {
+            Event::MouseMove { x, y } | Event::MouseMoveSmooth { x, y, .. } => {
+                if let Event::MouseMoveSmooth { duration_ms, .. } = timed.event {
+                    position.smooth_duration_ms = Some(duration_ms.get());
+                }
                 position.x = i64::from(*x);
                 position.y = i64::from(*y);
                 ActionKind::Move
@@ -596,6 +615,20 @@ impl PositionFields {
                 self.key_picker(ui);
             }
         });
+        if self.kind == ActionKind::Move {
+            ui.horizontal(|ui| {
+                let mut smooth = self.smooth_duration_ms.is_some();
+                ui.checkbox(&mut smooth, "Плавное перемещение");
+                if smooth {
+                    let duration = self.smooth_duration_ms.get_or_insert(300);
+                    let label = ui.label("Длительность, мс");
+                    ui.add(egui::DragValue::new(duration).range(1..=u32::MAX))
+                        .labelled_by(label.id);
+                } else {
+                    self.smooth_duration_ms = None;
+                }
+            });
+        }
     }
 
     fn key_picker(&mut self, ui: &mut egui::Ui) {
@@ -646,10 +679,19 @@ impl PositionFields {
     fn to_timed_event(&self) -> Result<TimedEvent, String> {
         let delay_micros = parse_delay(&self.delay).ok_or("Проверь задержку в миллисекундах.")?;
         let event = match self.kind {
-            ActionKind::Move => Event::MouseMove {
-                x: i32::try_from(self.x).map_err(|_| "Координата X вне допустимого диапазона.")?,
-                y: i32::try_from(self.y).map_err(|_| "Координата Y вне допустимого диапазона.")?,
-            },
+            ActionKind::Move => {
+                let x =
+                    i32::try_from(self.x).map_err(|_| "Координата X вне допустимого диапазона.")?;
+                let y =
+                    i32::try_from(self.y).map_err(|_| "Координата Y вне допустимого диапазона.")?;
+                if let Some(duration) = self.smooth_duration_ms {
+                    let duration_ms = std::num::NonZeroU32::new(duration)
+                        .ok_or("Укажи длительность перемещения больше нуля.")?;
+                    Event::MouseMoveSmooth { x, y, duration_ms }
+                } else {
+                    Event::MouseMove { x, y }
+                }
+            }
             ActionKind::MouseDown => Event::MouseDown {
                 button: self.button,
             },
@@ -732,6 +774,9 @@ fn parse_delay(text: &str) -> Option<u64> {
 fn describe(event: &Event) -> String {
     match event {
         Event::MouseMove { x, y } => format!("Перемещение курсора ({x}, {y})"),
+        Event::MouseMoveSmooth { x, y, duration_ms } => {
+            format!("Плавное перемещение до ({x}, {y}) за {duration_ms} мс")
+        }
         Event::MouseDown { button } => format!("Нажатие кнопки · {}", button_name(*button)),
         Event::MouseUp { button } => format!("Отпускание кнопки · {}", button_name(*button)),
         Event::Scroll { x, y } => format!("Прокрутка ({x}, {y})"),
@@ -752,6 +797,38 @@ fn button_name(button: MouseButton) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smooth_move_is_a_single_editable_action() {
+        let fields = PositionFields {
+            x: 110,
+            y: 74,
+            delay: "20".into(),
+            smooth_duration_ms: Some(300),
+            ..Default::default()
+        };
+        let event = fields.to_timed_event().unwrap();
+        assert_eq!(event.delay_micros, 20_000);
+        assert!(matches!(
+            event.event,
+            Event::MouseMoveSmooth { x: 110, y: 74, .. }
+        ));
+        assert_eq!(
+            PositionFields::from_event(&event).to_timed_event().unwrap(),
+            event
+        );
+        let mut editor = Editor::new(Scenario {
+            coordinates: CoordinateSpace::Desktop,
+            events: vec![TimedEvent {
+                delay_micros: 0,
+                event: Event::MouseMove { x: 0, y: 0 },
+            }],
+        });
+        editor.form = Some(PositionForm::default());
+        editor.apply_position(event.clone());
+        assert_eq!(editor.scenario.events.len(), 2);
+        assert_eq!(editor.scenario.events[1], event);
+    }
 
     #[test]
     fn shift_selects_ranges_both_ways_and_ctrl_toggles_individual_rows() {
