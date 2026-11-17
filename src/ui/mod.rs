@@ -25,8 +25,9 @@ use crate::core::scenario::Scenario;
 use crate::platform::windows::hotkeys::{
     Action as HotkeyAction, HotkeyEvent, HotkeyService, HotkeySettings,
 };
+use crate::platform::windows::target::{open_windows, OpenWindow};
 use crate::platform::windows::{
-    play_with_updates, record_with_shortcut, validate_playback, PlaybackUpdate, RecordingUpdate,
+    play_with_target, record_with_shortcut, validate_playback, PlaybackUpdate, RecordingUpdate,
 };
 use crate::storage::{read_json, write_json_new, write_json_replace};
 
@@ -195,6 +196,7 @@ struct MainWindow {
     pending_recording: Option<Arc<Scenario>>,
     dialog_owner: isize,
     playback: PlaybackSettings,
+    playback_target: Option<OpenWindow>,
     editor: Option<Editor>,
     original: Option<Loaded>,
     close_prompt: bool,
@@ -353,15 +355,22 @@ impl MainWindow {
         let Some(loaded) = &self.loaded else { return };
         let scenario = Arc::clone(&loaded.scenario);
         let options = self.playback.options();
+        let target = self.playback_target.as_ref().map(|window| window.target);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         self.start_job(context, Some(stop), false, Status::Preparing, move |send| {
-            let result = play_with_updates((*scenario).clone(), options, &worker_stop, |update| {
-                send(Message::Progress(match update {
-                    PlaybackUpdate::Countdown(seconds) => Status::Countdown(seconds),
-                    PlaybackUpdate::Playing(pass) => Status::Playing(pass),
-                }));
-            });
+            let result = play_with_target(
+                (*scenario).clone(),
+                options,
+                &worker_stop,
+                target,
+                |update| {
+                    send(Message::Progress(match update {
+                        PlaybackUpdate::Countdown(seconds) => Status::Countdown(seconds),
+                        PlaybackUpdate::Playing(pass) => Status::Playing(pass),
+                    }));
+                },
+            );
             send(Message::Finished(result));
         });
     }
@@ -883,6 +892,7 @@ impl MainWindow {
                     .labelled_by(count_label.id);
                     ui.checkbox(&mut self.playback.infinite, "Повторять бесконечно");
                 });
+                self.draw_playback_target(ui);
             });
             let text = self.status_text();
             if !text.is_empty() {
@@ -923,6 +933,45 @@ impl MainWindow {
                 ui.set_min_width(ui.available_width());
                 self.draw_recent(ui);
             });
+        });
+    }
+
+    fn draw_playback_target(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let label = ui.label("Тестовое окно");
+            let selected = self.playback_target.as_ref();
+            egui::ComboBox::from_id_salt("playback_target")
+                .selected_text(selected.map_or("Любое активное окно", |window| {
+                    window.title.as_str()
+                }))
+                .width(300.0)
+                .truncate()
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    if ui
+                        .selectable_label(self.playback_target.is_none(), "Любое активное окно")
+                        .clicked()
+                    {
+                        self.playback_target = None;
+                        ui.close();
+                    }
+                    for window in open_windows() {
+                        let selected = self
+                            .playback_target
+                            .as_ref()
+                            .is_some_and(|selected| selected.target == window.target);
+                        if ui
+                            .selectable_label(selected, &window.title)
+                            .on_hover_text(&window.title)
+                            .clicked()
+                        {
+                            self.playback_target = Some(window);
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .labelled_by(label.id);
         });
     }
 

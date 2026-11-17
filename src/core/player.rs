@@ -113,6 +113,15 @@ pub fn play(
 pub fn play_with_options(
     scenario: Scenario,
     options: PlaybackOptions,
+    send: impl FnMut(&Event) -> io::Result<()> + Send + 'static,
+) -> io::Result<Playback> {
+    play_with_guard(scenario, options, || Ok(()), send)
+}
+
+pub(crate) fn play_with_guard(
+    scenario: Scenario,
+    options: PlaybackOptions,
+    mut before_event: impl FnMut() -> io::Result<()> + Send + 'static,
     mut send: impl FnMut(&Event) -> io::Result<()> + Send + 'static,
 ) -> io::Result<Playback> {
     options.validate(&scenario)?;
@@ -125,7 +134,14 @@ pub fn play_with_options(
     let worker = thread::Builder::new()
         .name("keyo-playback".into())
         .spawn(move || {
-            let outcome = run(&scenario, options, &worker_stop, &worker_pass, &mut send);
+            let outcome = run(
+                &scenario,
+                options,
+                &worker_stop,
+                &worker_pass,
+                &mut before_event,
+                &mut send,
+            );
             let _ = sender.send(outcome);
         })?;
     Ok(Playback {
@@ -141,6 +157,7 @@ fn run(
     options: PlaybackOptions,
     stopped: &AtomicBool,
     pass: &Mutex<Option<PlaybackPass>>,
+    before_event: &mut impl FnMut() -> io::Result<()>,
     send: &mut impl FnMut(&Event) -> io::Result<()>,
 ) -> io::Result<PlaybackOutcome> {
     if scenario.events.is_empty() {
@@ -164,6 +181,7 @@ fn run(
                 input.release_all()?;
                 return Ok(PlaybackOutcome::Stopped);
             }
+            before_event()?;
             input.send(&timed.event)?;
         }
         input.release_all()?;
@@ -204,6 +222,50 @@ fn wait_until(deadline: Instant, stopped: &AtomicBool) -> bool {
 mod tests {
     use super::*;
     use crate::core::scenario::TimedEvent;
+
+    #[test]
+    fn losing_target_focus_releases_held_input_without_sending_the_next_event() {
+        let key = String::from("ControlLeft");
+        let down = Event::KeyDown { key: key.clone() };
+        let (sender, receiver) = mpsc::channel();
+        let mut checks = 0;
+        let playback = play_with_guard(
+            Scenario {
+                events: vec![
+                    TimedEvent {
+                        delay_micros: 0,
+                        event: down.clone(),
+                    },
+                    TimedEvent {
+                        delay_micros: 0,
+                        event: Event::Scroll { x: 0, y: 1 },
+                    },
+                ],
+            },
+            PlaybackOptions::default(),
+            move || {
+                checks += 1;
+                if checks > 1 {
+                    return Err(io::Error::other("Окно потеряло фокус"));
+                }
+                Ok(())
+            },
+            move |event| {
+                sender.send(event.clone()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let result = playback
+            .result
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "Окно потеряло фокус");
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<_>>(),
+            [down, Event::KeyUp { key }]
+        );
+    }
 
     #[test]
     fn infinite_playback_can_stop_in_the_middle_of_a_delay() {

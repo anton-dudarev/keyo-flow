@@ -25,6 +25,7 @@ mod capture;
 mod corner;
 #[cfg(feature = "gui")]
 pub(crate) mod hotkeys;
+pub(crate) mod target;
 #[cfg(feature = "gui")]
 pub(crate) use capture::record_with_shortcut;
 pub use capture::{record, record_with_updates, RecordingUpdate};
@@ -87,6 +88,16 @@ pub fn play_with_updates(
     scenario: Scenario,
     options: PlaybackOptions,
     cancelled: &AtomicBool,
+    report: impl FnMut(PlaybackUpdate),
+) -> io::Result<PlaybackOutcome> {
+    play_with_target(scenario, options, cancelled, None, report)
+}
+
+pub(crate) fn play_with_target(
+    scenario: Scenario,
+    options: PlaybackOptions,
+    cancelled: &AtomicBool,
+    target: Option<target::PlaybackTarget>,
     mut report: impl FnMut(PlaybackUpdate),
 ) -> io::Result<PlaybackOutcome> {
     options.validate(&scenario)?;
@@ -114,10 +125,13 @@ pub fn play_with_updates(
         return Ok(PlaybackOutcome::Stopped);
     }
 
-    let playback = player::play_with_options(scenario, options, move |event| {
+    let check_target = move || target.map_or(Ok(()), target::PlaybackTarget::check_focus);
+    check_target()?;
+    let playback = player::play_with_guard(scenario, options, check_target, move |event| {
         desktop.convert(event)?.send()
     })?;
     let mut last_reported = 0;
+    let mut focus_error = None;
     loop {
         if stop() {
             playback.stop();
@@ -129,8 +143,16 @@ pub fn play_with_updates(
             }
         }
         match playback.result.try_recv() {
-            Ok(result) => return result,
-            Err(TryRecvError::Empty) => wait_for_messages(),
+            Ok(result) => return focus_error.map_or(result, Err),
+            Err(TryRecvError::Empty) => {
+                if focus_error.is_none() && !stop() {
+                    if let Err(error) = check_target() {
+                        focus_error = Some(error);
+                        playback.stop();
+                    }
+                }
+                wait_for_messages();
+            }
             Err(TryRecvError::Disconnected) => {
                 return Err(io::Error::other(
                     "Поток воспроизведения завершился без результата",
