@@ -28,14 +28,17 @@ use crate::platform::windows::{
 use crate::storage::{read_json, write_json_new, write_json_replace};
 
 mod editor;
+mod placement;
 mod recent;
 use editor::{Editor, EditorAction};
+use placement::{RestorePlacement, WindowSettings};
 use recent::RecentScenarios;
 
 const WINDOW_SIZE: [f32; 2] = [620.0, 590.0];
 
 pub fn run() -> eframe::Result {
     let recent = RecentScenarios::load();
+    let windows = WindowSettings::load();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(WINDOW_SIZE)
@@ -50,10 +53,15 @@ pub fn run() -> eframe::Result {
             configure_style(&context.egui_ctx);
             Ok(Box::new(MainWindow {
                 recent,
+                windows,
                 ..Default::default()
             }))
         }),
     )
+}
+
+fn profile_file(name: &str) -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Keyo").join(name))
 }
 
 #[derive(Clone)]
@@ -171,6 +179,8 @@ struct MainWindow {
     close_prompt: bool,
     recent: RecentScenarios,
     recent_error: Option<String>,
+    windows: WindowSettings,
+    restore_main: RestorePlacement,
 }
 
 enum CloseDecision {
@@ -478,6 +488,7 @@ impl MainWindow {
 
 impl eframe::App for MainWindow {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.windows.main.update(ctx, &mut self.restore_main, false);
         self.poll_messages();
         if ctx.input(|input| input.viewport().close_requested()) {
             self.handle_close_request(ctx);
@@ -517,7 +528,12 @@ impl eframe::App for MainWindow {
                 }
             }
         } else if let Some(action) = self.editor.as_mut().and_then(|editor| {
-            editor.show(&context, file_name.unwrap_or_default(), self.job.is_some())
+            editor.show(
+                &context,
+                file_name.unwrap_or_default(),
+                self.job.is_some(),
+                &mut self.windows.editor,
+            )
         }) {
             if matches!(action, EditorAction::SaveAndClose) {
                 self.save_current(&context, false);
@@ -529,6 +545,10 @@ impl eframe::App for MainWindow {
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.windows.save();
     }
 }
 

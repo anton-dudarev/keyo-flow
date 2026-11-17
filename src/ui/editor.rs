@@ -5,9 +5,14 @@ use eframe::egui::{self, Align, RichText};
 use crate::core::scenario::{Event, MouseButton, Scenario, TimedEvent};
 use crate::platform::windows::{key_names, validate_event};
 
-use super::{close_dialog, CloseDecision};
+use super::{
+    close_dialog,
+    placement::{RestorePlacement, WindowPlacement},
+    CloseDecision,
+};
 
 pub(super) const EDITOR_SIZE: [f32; 2] = [820.0, 550.0];
+pub(super) const EDITOR_MIN_SIZE: [f32; 2] = [680.0, 360.0];
 const ROW_HEIGHT: f32 = 25.0;
 
 pub(super) enum EditorAction {
@@ -27,6 +32,7 @@ pub(super) struct Editor {
     form: Option<PositionForm>,
     reveal: Option<usize>,
     close_prompt: bool,
+    restore_placement: RestorePlacement,
 }
 
 impl Editor {
@@ -42,6 +48,7 @@ impl Editor {
             form: None,
             reveal: None,
             close_prompt: false,
+            restore_placement: RestorePlacement::default(),
         };
         editor.select(0);
         editor
@@ -149,16 +156,20 @@ impl Editor {
         context: &egui::Context,
         file_name: &str,
         saving: bool,
+        placement: &mut WindowPlacement,
     ) -> Option<EditorAction> {
         context.show_viewport_immediate(
             egui::ViewportId::from_hash_of("keyo-scenario-editor"),
             egui::ViewportBuilder::default()
                 .with_title("Редактор сценария — Keyo")
                 .with_inner_size(EDITOR_SIZE)
-                .with_min_inner_size([680.0, 360.0])
+                .with_min_inner_size(EDITOR_MIN_SIZE)
                 .with_resizable(true)
                 .with_maximize_button(true),
-            |ui, _| {
+            |ui, class| {
+                if class != egui::ViewportClass::EmbeddedWindow {
+                    placement.update(ui.ctx(), &mut self.restore_placement, true);
+                }
                 if saving {
                     if ui.input(|input| input.viewport().close_requested()) {
                         ui.ctx()

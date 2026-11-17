@@ -14,10 +14,7 @@ pub(super) struct RecentScenarios {
 
 impl RecentScenarios {
     pub(super) fn load() -> Self {
-        let file = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .map(|dir| dir.join("Keyo").join("recent.json"));
-        Self::from_file(file)
+        Self::from_file(super::profile_file("recent.json"))
     }
 
     fn from_file(file: Option<PathBuf>) -> Self {

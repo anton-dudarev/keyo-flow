@@ -1,6 +1,6 @@
 [package]
 name = "keyo-flow"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 default-run = "keyo"
 
@@ -14,7 +14,7 @@ path = "src/bin/keyo-gui.rs"
 required-features = ["gui"]
 
 [features]
-gui = ["dep:eframe", "windows-sys/Win32_UI_Controls_Dialogs"]
+gui = ["dep:eframe", "windows-sys/Win32_Graphics_Gdi", "windows-sys/Win32_UI_Controls_Dialogs"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

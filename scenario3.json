@@ -1,0 +1,271 @@
+{
+  "version": 2,
+  "events": [
+    {
+      "delay_micros": 1427805,
+      "event": {
+        "type": "key_down",
+        "key": "A"
+      }
+    },
+    {
+      "delay_micros": 117780,
+      "event": {
+        "type": "key_down",
+        "key": "S"
+      }
+    },
+    {
+      "delay_micros": 92002,
+      "event": {
+        "type": "key_up",
+        "key": "A"
+      }
+    },
+    {
+      "delay_micros": 66039,
+      "event": {
+        "type": "key_down",
+        "key": "D"
+      }
+    },
+    {
+      "delay_micros": 34012,
+      "event": {
+        "type": "key_up",
+        "key": "S"
+      }
+    },
+    {
+      "delay_micros": 67107,
+      "event": {
+        "type": "key_up",
+        "key": "D"
+      }
+    },
+    {
+      "delay_micros": 91851,
+      "event": {
+        "type": "key_down",
+        "key": "F"
+      }
+    },
+    {
+      "delay_micros": 109026,
+      "event": {
+        "type": "key_up",
+        "key": "F"
+      }
+    },
+    {
+      "delay_micros": 175993,
+      "event": {
+        "type": "key_down",
+        "key": "G"
+      }
+    },
+    {
+      "delay_micros": 125040,
+      "event": {
+        "type": "key_up",
+        "key": "G"
+      }
+    },
+    {
+      "delay_micros": 125977,
+      "event": {
+        "type": "key_down",
+        "key": "H"
+      }
+    },
+    {
+      "delay_micros": 99977,
+      "event": {
+        "type": "key_up",
+        "key": "H"
+      }
+    },
+    {
+      "delay_micros": 117999,
+      "event": {
+        "type": "key_down",
+        "key": "J"
+      }
+    },
+    {
+      "delay_micros": 92076,
+      "event": {
+        "type": "key_up",
+        "key": "J"
+      }
+    },
+    {
+      "delay_micros": 133960,
+      "event": {
+        "type": "key_down",
+        "key": "K"
+      }
+    },
+    {
+      "delay_micros": 67013,
+      "event": {
+        "type": "key_up",
+        "key": "K"
+      }
+    },
+    {
+      "delay_micros": 183965,
+      "event": {
+        "type": "key_down",
+        "key": "L"
+      }
+    },
+    {
+      "delay_micros": 92008,
+      "event": {
+        "type": "key_up",
+        "key": "L"
+      }
+    },
+    {
+      "delay_micros": 511026,
+      "event": {
+        "type": "key_down",
+        "key": "Enter"
+      }
+    },
+    {
+      "delay_micros": 100980,
+      "event": {
+        "type": "key_up",
+        "key": "Enter"
+      }
+    },
+    {
+      "delay_micros": 964005,
+      "event": {
+        "type": "key_down",
+        "key": "L"
+      }
+    },
+    {
+      "delay_micros": 92011,
+      "event": {
+        "type": "key_up",
+        "key": "L"
+      }
+    },
+    {
+      "delay_micros": 117027,
+      "event": {
+        "type": "key_down",
+        "key": "K"
+      }
+    },
+    {
+      "delay_micros": 74996,
+      "event": {
+        "type": "key_up",
+        "key": "K"
+      }
+    },
+    {
+      "delay_micros": 125985,
+      "event": {
+        "type": "key_down",
+        "key": "J"
+      }
+    },
+    {
+      "delay_micros": 83999,
+      "event": {
+        "type": "key_up",
+        "key": "J"
+      }
+    },
+    {
+      "delay_micros": 125025,
+      "event": {
+        "type": "key_down",
+        "key": "H"
+      }
+    },
+    {
+      "delay_micros": 101034,
+      "event": {
+        "type": "key_up",
+        "key": "H"
+      }
+    },
+    {
+      "delay_micros": 133948,
+      "event": {
+        "type": "key_down",
+        "key": "G"
+      }
+    },
+    {
+      "delay_micros": 92027,
+      "event": {
+        "type": "key_up",
+        "key": "G"
+      }
+    },
+    {
+      "delay_micros": 125980,
+      "event": {
+        "type": "key_down",
+        "key": "F"
+      }
+    },
+    {
+      "delay_micros": 101195,
+      "event": {
+        "type": "key_up",
+        "key": "F"
+      }
+    },
+    {
+      "delay_micros": 141816,
+      "event": {
+        "type": "key_down",
+        "key": "D"
+      }
+    },
+    {
+      "delay_micros": 92013,
+      "event": {
+        "type": "key_up",
+        "key": "D"
+      }
+    },
+    {
+      "delay_micros": 167023,
+      "event": {
+        "type": "key_down",
+        "key": "S"
+      }
+    },
+    {
+      "delay_micros": 101185,
+      "event": {
+        "type": "key_up",
+        "key": "S"
+      }
+    },
+    {
+      "delay_micros": 175789,
+      "event": {
+        "type": "key_down",
+        "key": "A"
+      }
+    },
+    {
+      "delay_micros": 91985,
+      "event": {
+        "type": "key_up",
+        "key": "A"
+      }
+    }
+  ]
+}
