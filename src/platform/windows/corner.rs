@@ -53,6 +53,7 @@ mod tests {
             PlaybackOptions {
                 speed: 1.0,
                 repeats: RepeatMode::Infinite,
+                ..Default::default()
             },
             move |event| {
                 sender.send(event.clone()).unwrap();

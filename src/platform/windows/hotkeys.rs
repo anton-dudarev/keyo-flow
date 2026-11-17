@@ -69,6 +69,7 @@ pub(crate) struct HotkeySettings {
     pub(crate) record: Shortcut,
     pub(crate) play: Shortcut,
     pub(crate) show_playback_indicator: bool,
+    pub(crate) timing_variation: crate::core::timing::TimingVariation,
 }
 
 impl Default for HotkeySettings {
@@ -84,6 +85,7 @@ impl Default for HotkeySettings {
             record: shortcut("R"),
             play: shortcut("P"),
             show_playback_indicator: false,
+            timing_variation: Default::default(),
         }
     }
 }
@@ -153,6 +155,7 @@ impl HotkeySettings {
     }
 
     fn targets(&self) -> io::Result<Vec<(Action, Chord)>> {
+        self.timing_variation.validate()?;
         let mut targets = Vec::new();
         for (action, shortcut) in [(Action::Record, &self.record), (Action::Play, &self.play)] {
             if let Some(chord) = shortcut.chord().map_err(|error| {

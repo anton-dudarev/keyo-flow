@@ -3,3 +3,4 @@ pub mod recorder;
 mod safety;
 pub mod scenario;
 pub(crate) mod timeline;
+pub mod timing;

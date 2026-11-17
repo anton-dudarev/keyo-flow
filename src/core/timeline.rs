@@ -119,6 +119,7 @@ pub(crate) fn compact(scenario: &mut Scenario) {
 }
 
 impl Scenario {
+    #[cfg(any(feature = "gui", test))]
     pub(crate) fn merge_hold(&mut self, down: usize, up: usize) -> io::Result<()> {
         if down >= up || up >= self.events.len() {
             return Err(io::Error::other(

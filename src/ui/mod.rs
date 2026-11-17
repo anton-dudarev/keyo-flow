@@ -186,6 +186,7 @@ impl PlaybackSettings {
             } else {
                 RepeatMode::Count(self.count)
             },
+            ..Default::default()
         }
     }
 }
@@ -393,7 +394,8 @@ impl MainWindow {
         let Some(loaded) = &self.loaded else { return };
         self.playback_overlay_error = None;
         let scenario = Arc::clone(&loaded.scenario);
-        let options = self.playback.options();
+        let mut options = self.playback.options();
+        options.variation = self.hotkey_settings.timing_variation;
         let target = self.playback_target.as_ref().map(|window| window.target);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);

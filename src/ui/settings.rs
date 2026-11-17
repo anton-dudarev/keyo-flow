@@ -35,6 +35,7 @@ pub(super) struct SettingsDialog {
 impl SettingsDialog {
     pub(super) fn show(&mut self, context: &egui::Context, error: Option<&str>) -> Option<Choice> {
         let dialog = egui::Modal::new(egui::Id::unique("keyo-settings")).show(context, |ui| {
+            ui.set_max_width(510.0);
             ui.heading("Настройки");
             ui.label("Укажи клавишу, например K или F9, и нужные модификаторы.");
             ui.add_enabled_ui(!self.applying, |ui| {
@@ -46,6 +47,16 @@ impl SettingsDialog {
                     &mut self.draft.show_playback_indicator,
                     "Показывать индикатор воспроизведения",
                 );
+                ui.separator();
+                ui.label(egui::RichText::new("Разброс времени воспроизведения").strong());
+                ui.add(egui::Slider::new(&mut self.draft.timing_variation.delays_percent, 0..=100).text("Задержки, ±%"));
+                ui.add(egui::Slider::new(&mut self.draft.timing_variation.holds_percent, 0..=100).text("Удержания, ±%"));
+                ui.horizontal(|ui| {
+                    let label = ui.label("Начальное значение");
+                    ui.add(egui::DragValue::new(&mut self.draft.timing_variation.seed).range(0..=u32::MAX)).labelled_by(label.id);
+                });
+                ui.label("0% — точное время. Одинаковые параметры и начальное значение повторяют разброс.");
+                ui.label("Для сохранения порядка действий разброс удержания ограничивается соседними событиями.");
                 if let Some(error) = error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
@@ -110,6 +121,11 @@ mod tests {
                 ..Default::default()
             },
             show_playback_indicator: true,
+            timing_variation: crate::core::timing::TimingVariation {
+                delays_percent: 10,
+                holds_percent: 15,
+                seed: 42,
+            },
         };
         save(Some(&file), &config).unwrap();
         let restored = load(Some(&file));
@@ -120,5 +136,6 @@ mod tests {
         assert!(restored.play.shift);
         assert_eq!(restored.play.key, "F9");
         assert!(restored.show_playback_indicator);
+        assert_eq!(restored.timing_variation, config.timing_variation);
     }
 }

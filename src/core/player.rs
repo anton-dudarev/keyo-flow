@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::safety::PressedInputGuard;
 use super::scenario::{Event, Scenario};
+use super::timing::{TimingRandom, TimingVariation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackOutcome {
@@ -23,6 +24,7 @@ pub enum RepeatMode {
 pub struct PlaybackOptions {
     pub speed: f64,
     pub repeats: RepeatMode,
+    pub variation: TimingVariation,
 }
 
 impl Default for PlaybackOptions {
@@ -30,12 +32,14 @@ impl Default for PlaybackOptions {
         Self {
             speed: 1.0,
             repeats: RepeatMode::Count(1),
+            variation: TimingVariation::default(),
         }
     }
 }
 
 impl PlaybackOptions {
     pub(crate) fn validate(self, scenario: &Scenario) -> io::Result<()> {
+        self.variation.validate()?;
         if !self.speed.is_finite() || self.speed <= 0.0 || self.repeats == RepeatMode::Count(0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -102,6 +106,7 @@ pub fn play(
         PlaybackOptions {
             speed,
             repeats: RepeatMode::Count(repeats),
+            ..Default::default()
         },
         send,
     )
@@ -163,7 +168,17 @@ fn run(
     }
 
     let mut number = 0_u64;
+    let mut random = TimingRandom::new(options.variation.seed);
     while !stopped.load(Ordering::Relaxed) {
+        let varied = if options.variation.delays_percent > 0 || options.variation.holds_percent > 0
+        {
+            let varied = options.variation.apply(scenario, &mut random)?;
+            options.validate(&varied)?;
+            Some(varied)
+        } else {
+            None
+        };
+        let scenario = varied.as_ref().unwrap_or(scenario);
         number = number.saturating_add(1);
         let start = Instant::now();
         *pass.lock().unwrap() = Some(PlaybackPass {
@@ -221,6 +236,52 @@ mod tests {
     use super::*;
     use crate::core::scenario::TimedEvent;
     use crate::core::timeline::smooth_steps;
+
+    #[test]
+    fn varied_playback_can_stop_during_a_hold_and_release_input() {
+        let (sender, receiver) = mpsc::channel();
+        let scenario = Scenario {
+            coordinates: Default::default(),
+            events: vec![TimedEvent {
+                delay_micros: 0,
+                event: Event::KeyHold {
+                    key: "Space".into(),
+                    duration_micros: 60_000_000,
+                },
+            }],
+        };
+        let options = PlaybackOptions {
+            variation: TimingVariation {
+                delays_percent: 10,
+                holds_percent: 10,
+                seed: 42,
+            },
+            ..Default::default()
+        };
+        let playback = play_with_options(scenario, options, move |event| {
+            sender.send(event.clone()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let timeout = Duration::from_secs(3);
+        assert_eq!(
+            receiver.recv_timeout(timeout).unwrap(),
+            Event::KeyDown {
+                key: "Space".into()
+            }
+        );
+        playback.stop();
+        assert_eq!(
+            playback.result.recv_timeout(timeout).unwrap().unwrap(),
+            PlaybackOutcome::Stopped
+        );
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<_>>(),
+            [Event::KeyUp {
+                key: "Space".into()
+            }]
+        );
+    }
 
     #[test]
     fn stopping_during_a_recorded_mouse_hold_releases_the_button() {
@@ -489,6 +550,7 @@ mod tests {
             PlaybackOptions {
                 speed: 2.0,
                 repeats: RepeatMode::Infinite,
+                ..Default::default()
             },
             move |event| {
                 sender.send(event.clone()).unwrap();
@@ -514,6 +576,7 @@ mod tests {
         let options = PlaybackOptions {
             speed: 1.0,
             repeats: RepeatMode::Infinite,
+            ..Default::default()
         };
         assert_eq!(
             play_with_options(
