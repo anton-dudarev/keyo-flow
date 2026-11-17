@@ -32,6 +32,7 @@ use crate::platform::windows::{
 use crate::storage::{read_json, write_json_new, write_json_replace};
 
 mod editor;
+mod overlay;
 mod placement;
 mod recent;
 mod settings;
@@ -207,6 +208,8 @@ struct MainWindow {
     pending_recording: Option<Arc<Scenario>>,
     dialog_owner: isize,
     playback: PlaybackSettings,
+    playback_overlay: Option<overlay::Overlay>,
+    playback_overlay_error: Option<String>,
     playback_target: Option<OpenWindow>,
     record_relative: bool,
     editor: Option<Editor>,
@@ -382,6 +385,7 @@ impl MainWindow {
 
     fn play(&mut self, context: &egui::Context) {
         let Some(loaded) = &self.loaded else { return };
+        self.playback_overlay_error = None;
         let scenario = Arc::clone(&loaded.scenario);
         let options = self.playback.options();
         let target = self.playback_target.as_ref().map(|window| window.target);
@@ -683,6 +687,25 @@ impl eframe::App for MainWindow {
         if matches!(self.status, Status::RecordingReady) && !self.close_prompt {
             self.save_recording(ctx);
         }
+        if let Some(labels) = self
+            .playback_indicator()
+            .filter(|_| self.playback_overlay_error.is_none())
+        {
+            let progress = self.progress(ctx);
+            if let Err(error) = overlay::Overlay::show(
+                &mut self.playback_overlay,
+                ctx.pixels_per_point(),
+                ctx.theme() == Theme::Dark,
+                labels,
+                progress,
+            ) {
+                self.playback_overlay = None;
+                self.playback_overlay_error =
+                    Some(format!("Не удалось показать индикатор. {error}"));
+            }
+        } else {
+            self.playback_overlay = None;
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -740,29 +763,13 @@ impl MainWindow {
         } else {
             Color32::from_rgb(0, 95, 184)
         };
-        let (green, red, button_text) = if dark {
-            (
-                Color32::from_rgb(108, 213, 140),
-                Color32::from_rgb(255, 179, 180),
-                Color32::BLACK,
-            )
+        let green = playback_color(dark);
+        let (red, button_text) = if dark {
+            (Color32::from_rgb(255, 179, 180), Color32::BLACK)
         } else {
-            (
-                Color32::from_rgb(16, 112, 51),
-                Color32::from_rgb(164, 38, 44),
-                Color32::WHITE,
-            )
+            (Color32::from_rgb(164, 38, 44), Color32::WHITE)
         };
-        let surface = if dark {
-            Color32::from_gray(43)
-        } else {
-            Color32::from_gray(252)
-        };
-        let border = if dark {
-            Color32::from_gray(69)
-        } else {
-            Color32::from_gray(215)
-        };
+        let (surface, border) = card_colors(dark);
         let card = egui::Frame::new()
             .fill(surface)
             .stroke(egui::Stroke::new(1.0, border))
@@ -964,6 +971,9 @@ impl MainWindow {
                 } else {
                     ui.label(RichText::new(text).strong());
                 }
+            }
+            if let Some(error) = &self.playback_overlay_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
             }
             if active {
                 let hint = if matches!(self.status, Status::SelectingWindow(_)) {
@@ -1183,6 +1193,48 @@ impl MainWindow {
         self.job.as_ref().is_some_and(|job| job.stop.is_some())
     }
 
+    fn playback_indicator(&self) -> Option<overlay::Labels> {
+        if let Status::Playing(pass) = self.status {
+            if self.hotkey_settings.show_playback_indicator {
+                let (title, detail) = self.playback_labels(pass);
+                let completed = pass.number.saturating_sub(1);
+                let repeats = if self.playback.infinite {
+                    format!("{completed}/∞")
+                } else {
+                    format!("{completed}/{}", self.playback.count)
+                };
+                return Some(overlay::Labels {
+                    title,
+                    detail,
+                    repeats,
+                });
+            }
+        }
+        None
+    }
+
+    fn playback_labels(&self, pass: PlaybackPass) -> (String, Option<String>) {
+        if self.playback.infinite {
+            return (format!("Запуск {}", pass.number), Some("без лимита".into()));
+        }
+        let label = format!("Запуск {} из {}", pass.number, self.playback.count);
+        let remaining = self.loaded.as_ref().map(|loaded| {
+            let seconds = self.playback.remaining_seconds(
+                loaded.duration,
+                pass.number,
+                pass.started_at.elapsed(),
+            );
+            let clock = format!("{:02}:{:02}", seconds / 60 % 60, seconds % 60);
+            let hours = seconds / 3600;
+            if hours > 0 {
+                format!("осталось ≈ {hours}:{clock}")
+            } else {
+                format!("осталось ≈ {clock}")
+            }
+        });
+        (label, remaining)
+    }
+
     fn recording_active(&self) -> bool {
         self.job.as_ref().is_some_and(|job| job.recording)
     }
@@ -1211,25 +1263,11 @@ impl MainWindow {
             }
             Status::WindowSelected => "Тестовое окно выбрано".into(),
             Status::WindowSelectionCancelled => "Выбор тестового окна отменён".into(),
-            Status::Playing(pass) if self.playback.infinite => {
-                format!("Запуск {} · без лимита", pass.number)
-            }
             Status::Playing(pass) => {
-                let label = format!("Запуск {} из {}", pass.number, self.playback.count);
-                let Some(loaded) = &self.loaded else {
-                    return label;
-                };
-                let remaining = self.playback.remaining_seconds(
-                    loaded.duration,
-                    pass.number,
-                    pass.started_at.elapsed(),
-                );
-                let clock = format!("{:02}:{:02}", remaining / 60 % 60, remaining % 60);
-                let hours = remaining / 3600;
-                if hours > 0 {
-                    format!("{label} · осталось ≈ {hours}:{clock}")
-                } else {
-                    format!("{label} · осталось ≈ {clock}")
+                let (label, detail) = self.playback_labels(*pass);
+                match detail {
+                    Some(detail) => format!("{label} · {detail}"),
+                    None => label,
                 }
             }
             Status::Recording => "Идёт запись".into(),
@@ -1271,6 +1309,22 @@ impl MainWindow {
             }
             _ => None,
         }
+    }
+}
+
+fn playback_color(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(108, 213, 140)
+    } else {
+        Color32::from_rgb(16, 112, 51)
+    }
+}
+
+fn card_colors(dark: bool) -> (Color32, Color32) {
+    if dark {
+        (Color32::from_gray(43), Color32::from_gray(69))
+    } else {
+        (Color32::from_gray(252), Color32::from_gray(215))
     }
 }
 
@@ -1417,6 +1471,64 @@ fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indicator_counts_completed_repeats_instead_of_the_current_run() {
+        let mut window = MainWindow {
+            playback: PlaybackSettings {
+                count: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        window.hotkey_settings.show_playback_indicator = true;
+        for (number, expected) in [(1, "0/1000"), (123, "122/1000")] {
+            window.status = Status::Playing(PlaybackPass {
+                number,
+                started_at: Instant::now(),
+            });
+            assert_eq!(window.playback_indicator().unwrap().repeats, expected);
+        }
+        window.playback.infinite = true;
+        assert_eq!(window.playback_indicator().unwrap().repeats, "122/∞");
+    }
+
+    #[test]
+    fn playback_indicator_is_optional_and_only_visible_during_playback() {
+        let playing = || {
+            Status::Playing(PlaybackPass {
+                number: 2,
+                started_at: Instant::now(),
+            })
+        };
+        let mut window = MainWindow {
+            status: playing(),
+            playback: PlaybackSettings {
+                count: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(window.playback_indicator().is_none());
+        window.hotkey_settings.show_playback_indicator = true;
+        let labels = window.playback_indicator().unwrap();
+        assert_eq!(labels.title, "Запуск 2 из 3");
+        assert_eq!(labels.detail, None);
+        window.playback.infinite = true;
+        let labels = window.playback_indicator().unwrap();
+        assert_eq!(labels.title, "Запуск 2");
+        assert_eq!(labels.detail.as_deref(), Some("без лимита"));
+        for status in [
+            Status::Countdown(1),
+            Status::Recording,
+            Status::Stopping,
+            Status::Finished(PlaybackOutcome::Completed),
+            Status::Error("Ошибка".into()),
+        ] {
+            window.status = status;
+            assert!(window.playback_indicator().is_none());
+        }
+    }
 
     #[test]
     fn cancelling_window_selection_clears_the_job_and_ignores_late_results() {

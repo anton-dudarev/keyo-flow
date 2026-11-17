@@ -41,6 +41,11 @@ impl SettingsDialog {
                 shortcut(ui, Action::Record.title(), &mut self.draft.record);
                 ui.separator();
                 shortcut(ui, Action::Play.title(), &mut self.draft.play);
+                ui.separator();
+                ui.checkbox(
+                    &mut self.draft.show_playback_indicator,
+                    "Показывать индикатор воспроизведения",
+                );
                 if let Some(error) = error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
@@ -104,6 +109,7 @@ mod tests {
                 key: "F9".into(),
                 ..Default::default()
             },
+            show_playback_indicator: true,
         };
         save(Some(&file), &config).unwrap();
         let restored = load(Some(&file));
@@ -113,5 +119,6 @@ mod tests {
         assert_eq!(restored.record.key, "K");
         assert!(restored.play.shift);
         assert_eq!(restored.play.key, "F9");
+        assert!(restored.show_playback_indicator);
     }
 }

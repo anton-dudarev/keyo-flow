@@ -19,7 +19,8 @@ mod tests {
         assert_eq!(targets[0].1.code, u32::from(b'K'));
         assert!(HotkeySettings {
             record: record.clone(),
-            play: record
+            play: record,
+            ..Default::default()
         }
         .targets()
         .is_err());
@@ -52,6 +53,7 @@ pub(crate) struct Shortcut {
 pub(crate) struct HotkeySettings {
     pub(crate) record: Shortcut,
     pub(crate) play: Shortcut,
+    pub(crate) show_playback_indicator: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -7,8 +7,10 @@ use eframe::egui::{self, Pos2, Rect, Vec2, ViewportCommand, ViewportInfo};
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 use crate::storage::write_replacement;
 
@@ -177,15 +179,22 @@ fn work_area(position: Pos2) -> Option<Rect> {
         x: position.x.round() as i32,
         y: position.y.round() as i32,
     };
+    // SAFETY: точка передаётся по значению в физических пикселях.
+    monitor_work_area(unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) })
+}
+
+pub(super) fn foreground_work_area() -> Option<Rect> {
+    // SAFETY: оба вызова получают дескрипторы от Windows, включая допустимый пустой HWND.
+    monitor_work_area(unsafe { MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST) })
+}
+
+fn monitor_work_area(monitor: HMONITOR) -> Option<Rect> {
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
-    // SAFETY: передаём координаты в физических пикселях и валидный буфер MONITORINFO.
-    let ok = unsafe {
-        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
-        !monitor.is_null() && GetMonitorInfoW(monitor, &mut info) != 0
-    };
+    // SAFETY: передаём дескриптор монитора и валидный буфер MONITORINFO.
+    let ok = !monitor.is_null() && unsafe { GetMonitorInfoW(monitor, &mut info) != 0 };
     let area = info.rcWork;
     (ok && area.right > area.left && area.bottom > area.top).then(|| {
         Rect::from_min_max(
