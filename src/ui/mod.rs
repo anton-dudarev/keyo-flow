@@ -28,11 +28,14 @@ use crate::platform::windows::{
 use crate::storage::{read_json, write_json_new, write_json_replace};
 
 mod editor;
+mod recent;
 use editor::{Editor, EditorAction};
+use recent::RecentScenarios;
 
-const WINDOW_SIZE: [f32; 2] = [620.0, 290.0];
+const WINDOW_SIZE: [f32; 2] = [620.0, 590.0];
 
 pub fn run() -> eframe::Result {
+    let recent = RecentScenarios::load();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(WINDOW_SIZE)
@@ -43,9 +46,12 @@ pub fn run() -> eframe::Result {
     eframe::run_native(
         "Keyo",
         options,
-        Box::new(|context| {
+        Box::new(move |context| {
             configure_style(&context.egui_ctx);
-            Ok(Box::<MainWindow>::default())
+            Ok(Box::new(MainWindow {
+                recent,
+                ..Default::default()
+            }))
         }),
     )
 }
@@ -163,6 +169,8 @@ struct MainWindow {
     editor: Option<Editor>,
     original: Option<Loaded>,
     close_prompt: bool,
+    recent: RecentScenarios,
+    recent_error: Option<String>,
 }
 
 enum CloseDecision {
@@ -199,12 +207,31 @@ fn close_dialog(context: &egui::Context, message: &str, can_save: bool) -> Optio
 }
 
 impl MainWindow {
+    fn can_open(&self) -> bool {
+        self.job.is_none() && self.pending_recording.is_none() && self.original.is_none()
+    }
+
     fn open(&mut self, context: &egui::Context) {
         // SAFETY: получаем HWND активного окна в потоке интерфейса.
         let owner = unsafe { GetActiveWindow() } as isize;
         self.start_job(context, None, false, Status::Opening, move |send| {
             send(Message::Opened(load_selected(owner)));
         });
+    }
+
+    fn open_recent(&mut self, context: &egui::Context, path: PathBuf) {
+        self.start_job(context, None, false, Status::Opening, move |send| {
+            send(Message::Opened(load_path(path).map(Some)));
+        });
+    }
+
+    fn set_loaded(&mut self, loaded: Loaded) {
+        self.recent_error = self
+            .recent
+            .remember(&loaded.path)
+            .err()
+            .map(|error| format!("Не удалось сохранить список недавних. {error}"));
+        self.loaded = Some(loaded);
     }
 
     fn play(&mut self, context: &egui::Context) {
@@ -385,7 +412,7 @@ impl MainWindow {
                     self.status = match result {
                         Ok(loaded) => {
                             if let Some(loaded) = loaded {
-                                self.loaded = Some(loaded);
+                                self.set_loaded(loaded);
                             }
                             Status::Ready
                         }
@@ -421,7 +448,7 @@ impl MainWindow {
                             self.pending_recording = None;
                             self.original = None;
                             self.editor = None;
-                            self.loaded = Some(loaded);
+                            self.set_loaded(loaded);
                             Status::Saved
                         }
                         Ok(None) => {
@@ -589,9 +616,7 @@ impl MainWindow {
                         |ui| {
                             if ui
                                 .add_enabled(
-                                    self.job.is_none()
-                                        && self.pending_recording.is_none()
-                                        && self.original.is_none(),
+                                    self.can_open(),
                                     egui::Button::new("Открыть JSON")
                                         .min_size(egui::vec2(120.0, 36.0)),
                                 )
@@ -744,7 +769,53 @@ impl MainWindow {
                         .fill(accent),
                 );
             }
+            ui.add_space(12.0);
+            self.draw_recent(ui);
         });
+    }
+
+    fn draw_recent(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label(RichText::new("Недавние сценарии").strong());
+        if let Some(error) = &self.recent_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        if self.recent.paths.is_empty() {
+            ui.label("Недавних сценариев пока нет");
+            return;
+        }
+        let mut chosen = None;
+        ui.add_enabled_ui(self.can_open(), |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(275.0)
+                .show(ui, |ui| {
+                    for path in &self.recent.paths {
+                        let name = path
+                            .file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy();
+                        let selected = self
+                            .loaded
+                            .as_ref()
+                            .is_some_and(|loaded| &loaded.path == path);
+                        let row = ui
+                            .add_sized(
+                                [ui.available_width(), 22.0],
+                                egui::Button::selectable(selected, name).truncate(),
+                            )
+                            .on_hover_text(path.to_string_lossy());
+                        if row.double_clicked()
+                            || (row.has_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                        {
+                            chosen = Some(path.clone());
+                        }
+                    }
+                });
+        });
+        if let Some(path) = chosen {
+            self.open_recent(ui.ctx(), path);
+        }
     }
 }
 
@@ -860,9 +931,13 @@ fn load_selected(owner: isize) -> io::Result<Option<Loaded>> {
     let Some(path) = select_json(owner, false)? else {
         return Ok(None);
     };
+    load_path(path).map(Some)
+}
+
+fn load_path(path: PathBuf) -> io::Result<Loaded> {
     let scenario = read_json(BufReader::new(File::open(&path)?))?;
     validate_playback(&scenario)?;
-    Ok(Some(Loaded::new(path, Arc::new(scenario))))
+    Ok(Loaded::new(path, Arc::new(scenario)))
 }
 
 fn save_to_path(
@@ -959,6 +1034,71 @@ fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_list_displays_ten_rows_and_opens_only_on_double_click() {
+        let context = egui::Context::default();
+        let mut window = MainWindow::default();
+        let missing_dir = std::env::temp_dir().join(format!("keyo-missing-{}", std::process::id()));
+        for index in (1..=10).rev() {
+            window
+                .recent
+                .remember(&missing_dir.join(format!("recent-{index}.json")))
+                .unwrap();
+        }
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW_SIZE.into());
+        let frame = |window: &mut MainWindow, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| window.draw(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let output = frame(&mut window, vec![]);
+        let mut visible = output.shapes.iter().filter_map(|clipped| {
+            let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                return None;
+            };
+            let bounds = text.visual_bounding_rect();
+            (text.galley.text().starts_with("recent-")
+                && rect.contains_rect(bounds)
+                && clipped.clip_rect.contains_rect(bounds))
+            .then_some(bounds.center())
+        });
+        let row = visible.next().unwrap();
+        assert_eq!(visible.count(), 9);
+        assert!(window.loaded.is_none() && window.job.is_none());
+        frame(&mut window, vec![egui::Event::PointerMoved(row)]);
+        for click in 0..2 {
+            for pressed in [true, false] {
+                frame(
+                    &mut window,
+                    vec![egui::Event::PointerButton {
+                        pos: row,
+                        pressed,
+                        button: egui::PointerButton::Primary,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            assert_eq!(window.job.is_some(), click == 1);
+        }
+        let result = window
+            .job
+            .as_ref()
+            .unwrap()
+            .messages
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            matches!(result, Message::Opened(Err(error)) if error.kind() == io::ErrorKind::NotFound)
+        );
+    }
 
     #[test]
     fn replacing_a_saved_scenario_requires_confirmation() {

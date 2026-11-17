@@ -70,7 +70,7 @@ pub fn write_json_replace(path: &Path, scenario: &Scenario) -> io::Result<()> {
     })
 }
 
-fn write_replacement(
+pub(crate) fn write_replacement(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
 ) -> io::Result<()> {

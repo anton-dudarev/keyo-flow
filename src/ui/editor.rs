@@ -145,6 +145,23 @@ impl Editor {
     }
 
     pub(super) fn draw(&mut self, ui: &mut egui::Ui) -> Option<EditorAction> {
+        let editing_row = self
+            .form
+            .as_ref()
+            .is_some_and(|form| form.replace.is_some());
+        if editing_row && !self.close_prompt && !egui::Popup::is_any_open(ui.ctx()) {
+            let background = ui.interact(
+                ui.max_rect(),
+                ui.scope_id().with("exit-row-edit"),
+                egui::Sense::click(),
+            );
+            if background.clicked()
+                || ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                self.form = None;
+                self.error = None;
+            }
+        }
         let mut action = None;
         egui::Panel::top("editor-header")
             .exact_size(58.0)
@@ -388,6 +405,7 @@ struct PositionFields {
     button: MouseButton,
     key: String,
     key_search: String,
+    key_picker_open: bool,
     delay: String,
 }
 
@@ -400,6 +418,7 @@ impl Default for PositionFields {
             button: MouseButton::Left,
             key: "A".into(),
             key_search: String::new(),
+            key_picker_open: false,
             delay: "0".into(),
         }
     }
@@ -489,16 +508,18 @@ impl PositionFields {
     }
 
     fn key_picker(&mut self, ui: &mut egui::Ui) {
-        egui::ComboBox::from_id_salt("key-picker")
+        let popup = egui::ComboBox::from_id_salt("key-picker")
             .selected_text("Выбрать клавишу")
             .height(265.0)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show_ui(ui, |ui| {
-                let search_changed = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.key_search).hint_text("Поиск клавиши"),
-                    )
-                    .changed();
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.key_search).hint_text("Поиск клавиши"),
+                );
+                if !self.key_picker_open {
+                    search.request_focus();
+                }
+                let search_changed = search.changed();
                 let query = self.key_search.trim().to_lowercase();
                 let mut results = egui::ScrollArea::vertical()
                     .max_height(200.0)
@@ -528,6 +549,7 @@ impl PositionFields {
                     }
                 });
             });
+        self.key_picker_open = popup.inner.is_some();
     }
 
     fn to_timed_event(&self) -> Result<TimedEvent, String> {
@@ -689,6 +711,100 @@ mod tests {
             button: egui::PointerButton::Primary,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn clicking_empty_editor_space_leaves_the_row_form() {
+        let context = egui::Context::default();
+        let original = TimedEvent {
+            delay_micros: 0,
+            event: Event::KeyDown { key: "A".into() },
+        };
+        let mut editor = Editor::new(Scenario {
+            events: vec![original.clone()],
+        });
+        editor.begin_edit(0);
+        let empty = egui::pos2(400.0, 220.0);
+        frame(&context, &mut editor, vec![]);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(empty)],
+        );
+        frame(&context, &mut editor, vec![button(empty, true)]);
+        frame(&context, &mut editor, vec![button(empty, false)]);
+        assert!(editor.form.is_none());
+        assert_eq!(editor.scenario.events, [original]);
+    }
+
+    #[test]
+    fn typing_after_opening_the_picker_goes_to_search() {
+        let context = egui::Context::default();
+        let mut editor = Editor::new(Scenario {
+            events: vec![TimedEvent {
+                delay_micros: 0,
+                event: Event::KeyDown { key: "A".into() },
+            }],
+        });
+        editor.begin_edit(0);
+        let output = frame(&context, &mut editor, vec![]);
+        let picker = point(&output, "Выбрать клавишу", false);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(picker)],
+        );
+        frame(&context, &mut editor, vec![button(picker, true)]);
+        frame(&context, &mut editor, vec![button(picker, false)]);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::Text("MediaStop".into())],
+        );
+        assert_eq!(
+            editor.form.as_ref().unwrap().position.key_search,
+            "MediaStop"
+        );
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(editor.form.is_some());
+        assert!(!egui::Popup::is_any_open(&context));
+    }
+
+    #[test]
+    fn escape_leaves_a_row_form_without_applying_it() {
+        let context = egui::Context::default();
+        let original = TimedEvent {
+            delay_micros: 0,
+            event: Event::KeyDown { key: "A".into() },
+        };
+        let mut editor = Editor::new(Scenario {
+            events: vec![original.clone()],
+        });
+        editor.begin_edit(0);
+        editor.form.as_mut().unwrap().position.key = "B".into();
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(editor.form.is_none());
+        assert_eq!(editor.scenario.events, [original]);
     }
 
     #[test]
