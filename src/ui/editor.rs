@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use eframe::egui::{self, Align, RichText};
 
 use crate::core::scenario::{Event, MouseButton, Scenario, TimedEvent};
@@ -18,6 +20,8 @@ pub(super) struct Editor {
     pub scenario: Scenario,
     pub changed: bool,
     selected: usize,
+    selection: BTreeSet<usize>,
+    anchor: usize,
     delay: String,
     error: Option<String>,
     form: Option<PositionForm>,
@@ -31,6 +35,8 @@ impl Editor {
             scenario,
             changed: false,
             selected: 0,
+            selection: BTreeSet::new(),
+            anchor: 0,
             delay: String::new(),
             error: None,
             form: None,
@@ -42,6 +48,15 @@ impl Editor {
     }
 
     fn select(&mut self, index: usize) {
+        self.selection.clear();
+        if index < self.scenario.events.len() {
+            self.selection.insert(index);
+        }
+        self.anchor = index;
+        self.set_active(index);
+    }
+
+    fn set_active(&mut self, index: usize) {
         self.selected = index;
         self.delay = self
             .scenario
@@ -49,6 +64,43 @@ impl Editor {
             .get(index)
             .map_or_else(String::new, |event| format_delay(event.delay_micros));
         self.error = None;
+    }
+
+    fn select_with_modifiers(&mut self, index: usize, modifiers: egui::Modifiers) {
+        if modifiers.shift {
+            if !modifiers.ctrl {
+                self.selection.clear();
+            }
+            self.selection
+                .extend(self.anchor.min(index)..=self.anchor.max(index));
+            self.set_active(index);
+        } else if modifiers.ctrl {
+            self.anchor = index;
+            if !self.selection.remove(&index) {
+                self.selection.insert(index);
+            }
+            self.set_active(
+                self.selection
+                    .get(&index)
+                    .copied()
+                    .or_else(|| self.selection.first().copied())
+                    .unwrap_or(index),
+            );
+        } else {
+            self.select(index);
+        }
+    }
+
+    fn delete_selection(&mut self) {
+        let Some(&first) = self.selection.first() else {
+            return;
+        };
+        if self.scenario.remove_events(&self.selection) {
+            self.changed = true;
+            self.select(first.min(self.scenario.events.len().saturating_sub(1)));
+        } else {
+            self.error = Some("Суммарная задержка следующего события слишком велика.".into());
+        }
     }
 
     pub(super) fn can_apply(&self) -> bool {
@@ -186,10 +238,11 @@ impl Editor {
                 );
             });
         let controls_height = if self.form.is_some() { 125.0 } else { 70.0 };
+        let mut editing_text = false;
         egui::Panel::bottom("editor-controls")
             .exact_size(controls_height)
             .show(ui, |ui| {
-                self.controls(ui);
+                editing_text = self.controls(ui);
                 ui.allocate_ui(egui::vec2(ui.available_width(), 20.0), |ui| {
                     if let Some(error) = &self.error {
                         ui.colored_label(ui.visuals().error_fg_color, error);
@@ -197,10 +250,24 @@ impl Editor {
                 });
             });
         egui::CentralPanel::default().show(ui, |ui| self.rows(ui));
+        if !editing_text
+            && self.form.is_none()
+            && !self.close_prompt
+            && !egui::Popup::is_any_open(ui.ctx())
+        {
+            if ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::A)) {
+                self.selection = (0..self.scenario.events.len()).collect();
+                ui.ctx().request_repaint();
+            }
+            if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
+                self.delete_selection();
+                ui.ctx().request_repaint();
+            }
+        }
         action
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui) {
+    fn controls(&mut self, ui: &mut egui::Ui) -> bool {
         if let Some(form) = &mut self.form {
             form.position.fields(ui);
             let (apply, cancel) = if form.replace.is_some() {
@@ -225,7 +292,7 @@ impl Editor {
                 }
                 None => {}
             }
-            return;
+            return true;
         }
         ui.horizontal(|ui| {
             if ui.button("Добавить позицию").clicked() {
@@ -233,14 +300,16 @@ impl Editor {
                 self.error = None;
             }
             if self.scenario.events.is_empty() {
-                return;
+                return false;
             }
             let label = ui.label("Задержка, мс");
-            if ui
-                .add(egui::TextEdit::singleline(&mut self.delay).desired_width(118.0))
-                .labelled_by(label.id)
-                .changed()
-            {
+            let delay = ui
+                .add_enabled(
+                    !self.selection.is_empty(),
+                    egui::TextEdit::singleline(&mut self.delay).desired_width(118.0),
+                )
+                .labelled_by(label.id);
+            if delay.changed() {
                 if let Some(delay) = parse_delay(&self.delay) {
                     let event = &mut self.scenario.events[self.selected];
                     self.changed |= event.delay_micros != delay;
@@ -252,22 +321,26 @@ impl Editor {
                     );
                 }
             }
-            if ui.button("Изменить").clicked() {
+            if ui
+                .add_enabled(!self.selection.is_empty(), egui::Button::new("Изменить"))
+                .clicked()
+            {
                 self.begin_edit(self.selected);
             }
-            if ui.button("Удалить событие").clicked() {
-                if self.scenario.remove_event(self.selected) {
-                    self.changed = true;
-                    self.select(
-                        self.selected
-                            .min(self.scenario.events.len().saturating_sub(1)),
-                    );
-                } else {
-                    self.error =
-                        Some("Суммарная задержка следующего события слишком велика.".into());
-                }
+            let delete_label = if self.selection.len() > 1 {
+                "Удалить выбранные"
+            } else {
+                "Удалить событие"
+            };
+            if ui
+                .add_enabled(!self.selection.is_empty(), egui::Button::new(delete_label))
+                .clicked()
+            {
+                self.delete_selection();
             }
-        });
+            delay.has_focus()
+        })
+        .inner
     }
 
     fn rows(&mut self, ui: &mut egui::Ui) {
@@ -278,6 +351,7 @@ impl Editor {
         let mut selected = None;
         let mut moved = None;
         let mut editing = None;
+        let modifiers = ui.input(|input| input.modifiers);
         let mut list = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if let Some(row) = self.reveal.take() {
             list = list.vertical_scroll_offset(row.saturating_sub(2) as f32 * ROW_HEIGHT);
@@ -313,14 +387,14 @@ impl Editor {
                 );
                 let response = ui.add_sized(
                     [ui.available_width(), ROW_HEIGHT],
-                    egui::Button::selectable(index == self.selected, label)
+                    egui::Button::selectable(self.selection.contains(&index), label)
                         .sense(egui::Sense::click_and_drag())
                         .truncate(),
                 );
                 if self.form.is_some() {
                     continue;
                 }
-                if response.double_clicked() {
+                if response.double_clicked() && !modifiers.ctrl && !modifiers.shift {
                     editing = Some(index);
                 } else if response.clicked() {
                     selected = Some(index);
@@ -354,7 +428,7 @@ impl Editor {
                 self.select(index);
             }
         } else if let Some(index) = selected {
-            self.select(index);
+            self.select_with_modifiers(index, modifiers);
         }
     }
 }
@@ -661,6 +735,88 @@ fn button_name(button: MouseButton) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shift_selects_ranges_both_ways_and_ctrl_toggles_individual_rows() {
+        let mut editor = editor_with_rows();
+        editor.select(2);
+        editor.select_with_modifiers(4, egui::Modifiers::SHIFT);
+        assert_eq!(editor.selection, BTreeSet::from([2, 3, 4]));
+        editor.select_with_modifiers(0, egui::Modifiers::SHIFT);
+        assert_eq!(editor.selection, BTreeSet::from([0, 1, 2]));
+        editor.select_with_modifiers(1, egui::Modifiers::CTRL);
+        editor.select_with_modifiers(4, egui::Modifiers::CTRL);
+        assert_eq!(editor.selection, BTreeSet::from([0, 2, 4]));
+        editor.delete_selection();
+        assert_eq!(
+            editor
+                .scenario
+                .events
+                .iter()
+                .map(|event| event.delay_micros)
+                .collect::<Vec<_>>(),
+            [30, 70]
+        );
+    }
+
+    fn editor_with_rows() -> Editor {
+        Editor::new(Scenario {
+            events: [10, 20, 30, 40, 50]
+                .into_iter()
+                .map(|delay_micros| TimedEvent {
+                    delay_micros,
+                    event: Event::Scroll { x: 0, y: 1 },
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn select_all_and_delete_apply_to_rows_or_text_according_to_focus() {
+        let context = egui::Context::default();
+        let mut editor = editor_with_rows();
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let press = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        frame(&context, &mut editor, vec![press(egui::Key::A, ctrl)]);
+        assert_eq!(editor.selection.len(), 5);
+        frame(
+            &context,
+            &mut editor,
+            vec![press(egui::Key::Delete, egui::Modifiers::NONE)],
+        );
+        assert!(editor.scenario.events.is_empty());
+
+        let context = egui::Context::default();
+        let mut editor = editor_with_rows();
+        let output = frame(&context, &mut editor, vec![]);
+        let delay = point(&output, "0,01", false);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(delay)],
+        );
+        frame(&context, &mut editor, vec![button(delay, true)]);
+        frame(&context, &mut editor, vec![button(delay, false)]);
+        frame(&context, &mut editor, vec![press(egui::Key::A, ctrl)]);
+        frame(
+            &context,
+            &mut editor,
+            vec![press(egui::Key::Delete, egui::Modifiers::NONE)],
+        );
+        assert!(editor.delay.is_empty());
+        assert_eq!(editor.scenario.events.len(), 5);
+        assert_eq!(editor.selection, BTreeSet::from([0]));
+    }
 
     fn frame(
         context: &egui::Context,

@@ -541,6 +541,19 @@ impl MainWindow {
         } else {
             Color32::from_rgb(0, 95, 184)
         };
+        let (green, red, button_text) = if dark {
+            (
+                Color32::from_rgb(108, 213, 140),
+                Color32::from_rgb(255, 179, 180),
+                Color32::BLACK,
+            )
+        } else {
+            (
+                Color32::from_rgb(16, 112, 51),
+                Color32::from_rgb(164, 38, 44),
+                Color32::WHITE,
+            )
+        };
         let surface = if dark {
             Color32::from_gray(43)
         } else {
@@ -551,11 +564,21 @@ impl MainWindow {
         } else {
             Color32::from_gray(215)
         };
+        let card = egui::Frame::new()
+            .fill(surface)
+            .stroke(egui::Stroke::new(1.0, border))
+            .corner_radius(8)
+            .inner_margin(16);
         let weak = if dark {
             Color32::from_gray(188)
         } else {
             Color32::from_gray(89)
         };
+        let active = self.input_active();
+        let has_events = self
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| !loaded.scenario.events.is_empty());
         egui::Frame::new().inner_margin(25).show(ui, |ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), 36.0),
@@ -592,11 +615,33 @@ impl MainWindow {
                             self.loaded = self.original.take();
                             self.status = Status::Ready;
                         }
-                    } else if ui
-                        .add_enabled(self.job.is_none(), egui::Button::new("Записать"))
-                        .clicked()
+                    } else if action_button(
+                        ui,
+                        self.job.is_none(),
+                        ActionIcon::Record,
+                        "Записать",
+                        red,
+                        button_text,
+                        111.0,
+                    )
+                    .clicked()
                     {
                         self.record(&context);
+                    }
+                    let (icon, label, fill) = if active {
+                        (ActionIcon::Stop, "Стоп", red)
+                    } else {
+                        (ActionIcon::Play, "Воспроизвести", green)
+                    };
+                    let enabled = (active
+                        && !matches!(self.status, Status::Stopping | Status::Recording))
+                        || (self.job.is_none() && self.pending_recording.is_none() && has_events);
+                    if action_button(ui, enabled, icon, label, fill, button_text, 140.0).clicked() {
+                        if active {
+                            self.stop();
+                        } else {
+                            self.play(&context);
+                        }
                     }
                     ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
                         ui.label(RichText::new("Сценарий").size(29.0).strong());
@@ -604,68 +649,64 @@ impl MainWindow {
                 },
             );
             ui.add_space(15.0);
-            egui::Frame::new()
-                .fill(surface)
-                .stroke(egui::Stroke::new(1.0, border))
-                .corner_radius(8)
-                .inner_margin(16)
-                .show(ui, |ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 40.0),
-                        egui::Layout::right_to_left(Align::Center),
-                        |ui| {
+            card.show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 40.0),
+                    egui::Layout::right_to_left(Align::Center),
+                    |ui| {
+                        if ui
+                            .add_enabled(
+                                self.can_open(),
+                                egui::Button::new("Открыть JSON").min_size(egui::vec2(120.0, 36.0)),
+                            )
+                            .clicked()
+                        {
+                            self.open(&context);
+                        }
+                        if let Some(loaded) = &self.loaded {
                             if ui
                                 .add_enabled(
-                                    self.can_open(),
-                                    egui::Button::new("Открыть JSON")
-                                        .min_size(egui::vec2(120.0, 36.0)),
+                                    self.job.is_none() && self.pending_recording.is_none(),
+                                    egui::Button::new("Редактировать")
+                                        .min_size(egui::vec2(116.0, 36.0)),
                                 )
                                 .clicked()
                             {
-                                self.open(&context);
+                                // SAFETY: здесь ещё активно основное окно, владелец диалога сохранения.
+                                self.dialog_owner = unsafe { GetActiveWindow() } as isize;
+                                self.editor = Some(Editor::new((*loaded.scenario).clone()));
                             }
-                            if let Some(loaded) = &self.loaded {
-                                if ui
-                                    .add_enabled(
-                                        self.job.is_none() && self.pending_recording.is_none(),
-                                        egui::Button::new("Редактировать")
-                                            .min_size(egui::vec2(116.0, 36.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    // SAFETY: здесь ещё активно основное окно, владелец диалога сохранения.
-                                    self.dialog_owner = unsafe { GetActiveWindow() } as isize;
-                                    self.editor = Some(Editor::new((*loaded.scenario).clone()));
-                                }
-                            }
+                        }
+                        if let Some(loaded) = &self.loaded {
                             ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
-                                if let Some(loaded) = &self.loaded {
-                                    ui.add(
-                                        egui::Label::new(RichText::new(&loaded.name).strong())
-                                            .truncate(),
-                                    )
-                                    .on_hover_text(&loaded.name);
-                                    let seconds = format!("{:.2}", loaded.duration.as_secs_f64())
-                                        .replace('.', ",");
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} · {seconds} с{}",
-                                            event_count(loaded.scenario.events.len()),
-                                            if self.original.is_some() {
-                                                " · есть правки"
-                                            } else {
-                                                ""
-                                            },
-                                        ))
-                                        .color(weak),
-                                    );
-                                } else {
-                                    ui.label(RichText::new("Сценарий не выбран").strong());
-                                }
+                                ui.add(
+                                    egui::Label::new(RichText::new(&loaded.name).strong())
+                                        .truncate(),
+                                )
+                                .on_hover_text(&loaded.name);
+                                let seconds = format!("{:.2}", loaded.duration.as_secs_f64())
+                                    .replace('.', ",");
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} · {seconds} с{}",
+                                        event_count(loaded.scenario.events.len()),
+                                        if self.original.is_some() {
+                                            " · есть правки"
+                                        } else {
+                                            ""
+                                        },
+                                    ))
+                                    .color(weak),
+                                );
                             });
-                        },
-                    );
-                });
+                        } else {
+                            ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+                                ui.label(RichText::new("Сценарий не выбран").strong());
+                            });
+                        }
+                    },
+                );
+            });
             ui.add_space(12.0);
             let can_configure = self.job.is_none() && self.pending_recording.is_none();
             ui.add_enabled_ui(can_configure, |ui| {
@@ -688,79 +729,27 @@ impl MainWindow {
                     ui.checkbox(&mut self.playback.infinite, "Повторять бесконечно");
                 });
             });
-            ui.add_space(12.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), 44.0),
-                egui::Layout::right_to_left(Align::Center),
-                |ui| {
-                    let active = self.input_active();
-                    let (label, fill, foreground) = if active {
-                        let fill = if dark {
-                            Color32::from_rgb(255, 179, 180)
-                        } else {
-                            Color32::from_rgb(164, 38, 44)
-                        };
-                        (
-                            "Стоп",
-                            fill,
-                            if dark { Color32::BLACK } else { Color32::WHITE },
-                        )
-                    } else {
-                        (
-                            "Воспроизвести",
-                            accent,
-                            if dark { Color32::BLACK } else { Color32::WHITE },
-                        )
-                    };
-                    let has_events = self
-                        .loaded
-                        .as_ref()
-                        .is_some_and(|loaded| !loaded.scenario.events.is_empty());
-                    let enabled = (active
-                        && !matches!(self.status, Status::Stopping | Status::Recording))
-                        || (self.job.is_none() && self.pending_recording.is_none() && has_events);
-                    if ui
-                        .add_enabled(
-                            enabled,
-                            egui::Button::new(RichText::new(label).color(foreground))
-                                .min_size(egui::vec2(140.0, 36.0))
-                                .corner_radius(6)
-                                .fill(fill),
-                        )
-                        .clicked()
-                    {
-                        if active {
-                            self.stop();
-                        } else {
-                            self.play(&context);
-                        }
-                    }
-                    ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
-                        let text = self.status_text();
-                        if matches!(self.status, Status::Error(_)) {
-                            ui.label(RichText::new(text).color(ui.visuals().error_fg_color));
-                        } else {
-                            ui.label(RichText::new(text).strong());
-                        }
-                        if active {
-                            let hint = if matches!(self.status, Status::Countdown(_)) {
-                                "Переключись в тестовое окно. Esc — остановить"
-                            } else if matches!(self.status, Status::Recording) {
-                                "Esc — завершить запись"
-                            } else {
-                                "Esc — остановить"
-                            };
-                            ui.label(RichText::new(hint).color(weak));
-                        } else if has_events && matches!(self.status, Status::Ready | Status::Saved)
-                        {
-                            ui.label(
-                                RichText::new("После запуска переключись в тестовое окно.")
-                                    .color(weak),
-                            );
-                        }
-                    });
-                },
-            );
+            let text = self.status_text();
+            if !text.is_empty() {
+                ui.add_space(12.0);
+                if matches!(self.status, Status::Error(_)) {
+                    ui.colored_label(ui.visuals().error_fg_color, text);
+                } else {
+                    ui.label(RichText::new(text).strong());
+                }
+            }
+            if active {
+                let hint = if matches!(self.status, Status::Countdown(_)) {
+                    "Переключись в тестовое окно. Esc — остановить"
+                } else if matches!(self.status, Status::Recording) {
+                    "Esc — завершить запись"
+                } else {
+                    "Esc — остановить"
+                };
+                ui.label(RichText::new(hint).color(weak));
+            } else if has_events && matches!(self.status, Status::Ready | Status::Saved) {
+                ui.label(RichText::new("После запуска переключись в тестовое окно.").color(weak));
+            }
             if let Some(fraction) = self.progress(&context) {
                 ui.add_space(12.0);
                 ui.add(
@@ -770,13 +759,15 @@ impl MainWindow {
                 );
             }
             ui.add_space(12.0);
-            self.draw_recent(ui);
+            ui.label(RichText::new("Недавние сценарии").strong());
+            card.show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                self.draw_recent(ui);
+            });
         });
     }
 
     fn draw_recent(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.label(RichText::new("Недавние сценарии").strong());
         if let Some(error) = &self.recent_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
@@ -819,6 +810,64 @@ impl MainWindow {
     }
 }
 
+enum ActionIcon {
+    Play,
+    Record,
+    Stop,
+}
+
+fn action_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: ActionIcon,
+    label: &str,
+    fill: Color32,
+    foreground: Color32,
+    width: f32,
+) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        let icon_id = egui::IdSalt::new("action-icon");
+        let button = egui::Button::new((
+            egui::Atom::custom(icon_id, egui::vec2(14.0, 14.0)),
+            RichText::new(label).color(foreground),
+        ))
+        .gap(7.0)
+        .min_size(egui::vec2(width, 36.0))
+        .corner_radius(6)
+        .fill(fill)
+        .atom_ui(ui);
+        if let Some(rect) = button.rect(icon_id) {
+            let center = rect.center();
+            let painter = ui.painter();
+            match icon {
+                ActionIcon::Play => {
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            center + egui::vec2(-4.0, -5.0),
+                            center + egui::vec2(5.0, 0.0),
+                            center + egui::vec2(-4.0, 5.0),
+                        ],
+                        foreground,
+                        egui::Stroke::new(1.25, foreground),
+                    ));
+                }
+                ActionIcon::Record => {
+                    painter.circle_filled(center, 5.5, foreground);
+                }
+                ActionIcon::Stop => {
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0)),
+                        2,
+                        foreground,
+                    );
+                }
+            }
+        }
+        button.response
+    })
+    .inner
+}
+
 impl MainWindow {
     fn input_active(&self) -> bool {
         self.job.as_ref().is_some_and(|job| job.stop.is_some())
@@ -830,7 +879,7 @@ impl MainWindow {
 
     fn status_text(&self) -> String {
         match &self.status {
-            Status::Ready if self.loaded.is_none() => "Открой JSON для воспроизведения".into(),
+            Status::Ready if self.loaded.is_none() => String::new(),
             Status::Ready
                 if self
                     .loaded
@@ -1300,9 +1349,9 @@ mod tests {
     fn playback_controls_fit_inside_the_window() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW_SIZE.into());
         for (theme, running, label, fill, scale) in [
-            (Theme::Light, false, "Воспроизвести", [0, 95, 184], 1.0),
+            (Theme::Light, false, "Воспроизвести", [16, 112, 51], 1.0),
             (Theme::Light, true, "Стоп", [164, 38, 44], 1.25),
-            (Theme::Dark, false, "Воспроизвести", [96, 205, 255], 1.25),
+            (Theme::Dark, false, "Воспроизвести", [108, 213, 140], 1.25),
             (Theme::Dark, true, "Стоп", [255, 179, 180], 1.5),
         ] {
             let context = egui::Context::default();
@@ -1340,6 +1389,42 @@ mod tests {
                 .native_pixels_per_point = Some(scale);
             let mut output = context.run_ui(input, |ui| window.draw(ui));
             output.textures_delta.clear();
+            let text_bounds = |label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|clipped| {
+                        let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                            return None;
+                        };
+                        (text.galley.text() == label).then(|| text.visual_bounding_rect())
+                    })
+                    .unwrap()
+            };
+            let playback = text_bounds(label);
+            let record = text_bounds("Записать");
+            assert!(playback.right() < record.left());
+            assert!((playback.center().y - record.center().y).abs() < 2.0);
+            assert!(output.shapes.iter().any(|clipped| {
+                let bounds = match &clipped.shape {
+                    egui::epaint::Shape::Path(shape) if !running && shape.points.len() == 3 => {
+                        shape.visual_bounding_rect()
+                    }
+                    egui::epaint::Shape::Rect(shape)
+                        if running && shape.rect.size() == egui::vec2(10.0, 10.0) =>
+                    {
+                        shape.rect
+                    }
+                    _ => return false,
+                };
+                bounds.right() < playback.left()
+                    && (bounds.center().y - playback.center().y).abs() < 3.0
+            }));
+            assert!(output.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::epaint::Shape::Circle(circle)
+                    if circle.radius == 5.5 && circle.center.x < record.left()
+                    && (circle.center.y - record.center().y).abs() < 3.0)
+            }));
             assert!(
                 output.shapes.iter().any(|clipped| {
                     let egui::epaint::Shape::Text(text) = &clipped.shape else {
@@ -1364,6 +1449,41 @@ mod tests {
                 }),
                 "Границы кнопки «{label}» не помещаются целиком"
             );
+        }
+    }
+
+    #[test]
+    fn empty_scenario_label_is_centered_on_the_open_button() {
+        for theme in [Theme::Light, Theme::Dark] {
+            let context = egui::Context::default();
+            configure_style(&context);
+            context.set_theme(theme);
+            let mut window = MainWindow::default();
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        WINDOW_SIZE.into(),
+                    )),
+                    ..Default::default()
+                },
+                |ui| window.draw(ui),
+            );
+            output.textures_delta.clear();
+            let y = |label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|clipped| {
+                        let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                            return None;
+                        };
+                        (text.galley.text() == label)
+                            .then(|| text.visual_bounding_rect().center().y)
+                    })
+                    .unwrap()
+            };
+            assert!((y("Сценарий не выбран") - y("Открыть JSON")).abs() < 2.0);
         }
     }
 

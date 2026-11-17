@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,16 +24,37 @@ impl Scenario {
 
     /// Удаляет событие, сохраняя исходные моменты всех оставшихся событий.
     pub fn remove_event(&mut self, index: usize) -> bool {
-        let Some(event) = self.events.get(index) else {
+        self.remove_events(&BTreeSet::from([index]))
+    }
+
+    /// Удаляет выбранные строки одним действием, сохраняя время оставшихся событий.
+    pub fn remove_events(&mut self, indices: &BTreeSet<usize>) -> bool {
+        if indices.last().is_none_or(|&last| last >= self.events.len()) {
             return false;
-        };
-        if let Some(next) = self.events.get(index + 1) {
-            let Some(delay) = event.delay_micros.checked_add(next.delay_micros) else {
-                return false;
-            };
-            self.events[index + 1].delay_micros = delay;
         }
-        self.events.remove(index);
+        let mut delay = 0_u128;
+        for (index, event) in self.events.iter().enumerate() {
+            delay += u128::from(event.delay_micros);
+            if indices.contains(&index) {
+                continue;
+            }
+            if delay > u128::from(u64::MAX) {
+                return false;
+            }
+            delay = 0;
+        }
+        delay = 0;
+        let mut index = 0;
+        self.events.retain_mut(|event| {
+            delay += u128::from(event.delay_micros);
+            let keep = !indices.contains(&index);
+            index += 1;
+            if keep {
+                event.delay_micros = delay as u64;
+                delay = 0;
+            }
+            keep
+        });
         true
     }
 }
@@ -81,6 +104,28 @@ pub enum MouseButton {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_disjoint_rows_keeps_the_remaining_events_at_the_same_times() {
+        let mut scenario = Scenario {
+            events: [10, 20, 30, 40, 50, 60]
+                .into_iter()
+                .map(|delay_micros| TimedEvent {
+                    delay_micros,
+                    event: Event::Scroll { x: 0, y: 1 },
+                })
+                .collect(),
+        };
+        assert!(scenario.remove_events(&BTreeSet::from([0, 2, 3, 5])));
+        assert_eq!(
+            scenario
+                .events
+                .iter()
+                .map(|event| event.delay_micros)
+                .collect::<Vec<_>>(),
+            [30, 120],
+        );
+    }
 
     #[test]
     fn moves_rows_in_both_directions_with_their_delays() {
