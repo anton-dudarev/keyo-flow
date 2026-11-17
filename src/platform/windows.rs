@@ -472,7 +472,9 @@ impl Inputs {
         let sent =
             unsafe { SendInput(self.count, self.values.as_ptr(), size_of::<INPUT>() as i32) };
         if sent != self.count {
-            return Err(os_error("Windows не приняла все события ввода"));
+            return Err(os_error(
+                "Windows не приняла все события ввода (проверьте, запущено ли тестируемое окно от имени администратора)",
+            ));
         }
         Ok(())
     }
