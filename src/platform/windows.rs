@@ -297,34 +297,121 @@ const NAMED_KEYS: &[(&str, u16)] = &[
     ("PageDown", VK_NEXT),
     ("Insert", VK_INSERT),
     ("Delete", VK_DELETE),
+    ("F1", VK_F1),
+    ("F2", VK_F2),
+    ("F3", VK_F3),
+    ("F4", VK_F4),
+    ("F5", VK_F5),
+    ("F6", VK_F6),
+    ("F7", VK_F7),
+    ("F8", VK_F8),
+    ("F9", VK_F9),
+    ("F10", VK_F10),
+    ("F11", VK_F11),
+    ("F12", VK_F12),
+    ("F13", VK_F13),
+    ("F14", VK_F14),
+    ("F15", VK_F15),
+    ("F16", VK_F16),
+    ("F17", VK_F17),
+    ("F18", VK_F18),
+    ("F19", VK_F19),
+    ("F20", VK_F20),
+    ("F21", VK_F21),
+    ("F22", VK_F22),
+    ("F23", VK_F23),
+    ("F24", VK_F24),
+    ("Numpad0", VK_NUMPAD0),
+    ("Numpad1", VK_NUMPAD1),
+    ("Numpad2", VK_NUMPAD2),
+    ("Numpad3", VK_NUMPAD3),
+    ("Numpad4", VK_NUMPAD4),
+    ("Numpad5", VK_NUMPAD5),
+    ("Numpad6", VK_NUMPAD6),
+    ("Numpad7", VK_NUMPAD7),
+    ("Numpad8", VK_NUMPAD8),
+    ("Numpad9", VK_NUMPAD9),
+    ("NumpadAdd", VK_ADD),
+    ("NumpadSubtract", VK_SUBTRACT),
+    ("NumpadMultiply", VK_MULTIPLY),
+    ("NumpadDivide", VK_DIVIDE),
+    ("NumpadDecimal", VK_DECIMAL),
+    ("NumpadSeparator", VK_SEPARATOR),
+    ("NumpadEnter", VK_RETURN),
+    ("CapsLock", VK_CAPITAL),
+    ("NumLock", VK_NUMLOCK),
+    ("ScrollLock", VK_SCROLL),
+    ("PrintScreen", VK_SNAPSHOT),
+    ("Pause", VK_PAUSE),
+    ("ContextMenu", VK_APPS),
+    ("Semicolon", VK_OEM_1),
+    ("Equal", VK_OEM_PLUS),
+    ("Comma", VK_OEM_COMMA),
+    ("Minus", VK_OEM_MINUS),
+    ("Period", VK_OEM_PERIOD),
+    ("Slash", VK_OEM_2),
+    ("Backquote", VK_OEM_3),
+    ("BracketLeft", VK_OEM_4),
+    ("Backslash", VK_OEM_5),
+    ("BracketRight", VK_OEM_6),
+    ("Quote", VK_OEM_7),
+    ("IntlBackslash", VK_OEM_102),
+    ("VolumeMute", VK_VOLUME_MUTE),
+    ("VolumeDown", VK_VOLUME_DOWN),
+    ("VolumeUp", VK_VOLUME_UP),
+    ("MediaNextTrack", VK_MEDIA_NEXT_TRACK),
+    ("MediaPreviousTrack", VK_MEDIA_PREV_TRACK),
+    ("MediaStop", VK_MEDIA_STOP),
+    ("MediaPlayPause", VK_MEDIA_PLAY_PAUSE),
 ];
+
+#[cfg(feature = "gui")]
+pub(crate) fn key_names() -> impl Iterator<Item = &'static str> {
+    [
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
+        "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    ]
+    .into_iter()
+    .chain(NAMED_KEYS.iter().map(|&(name, _)| name))
+}
 
 fn keyboard_code(key: &str) -> io::Result<(u16, u32)> {
     let code = match key.as_bytes() {
-        [b'K', b'e', b'y', letter @ b'A'..=b'Z'] => u16::from(*letter),
-        [b'D', b'i', b'g', b'i', b't', digit @ b'0'..=b'9'] => u16::from(*digit),
+        [character @ (b'A'..=b'Z' | b'0'..=b'9')] => u16::from(*character),
         _ => NAMED_KEYS
             .iter()
             .find_map(|&(name, code)| (name == key).then_some(code))
             .ok_or_else(|| invalid("Неподдерживаемый идентификатор клавиши"))?,
     };
-    let extended = matches!(
-        code,
-        VK_RCONTROL
-            | VK_RMENU
-            | VK_LWIN
-            | VK_RWIN
-            | VK_LEFT
-            | VK_RIGHT
-            | VK_UP
-            | VK_DOWN
-            | VK_HOME
-            | VK_END
-            | VK_PRIOR
-            | VK_NEXT
-            | VK_INSERT
-            | VK_DELETE
-    );
+    let extended = key == "NumpadEnter"
+        || matches!(
+            code,
+            VK_RCONTROL
+                | VK_RMENU
+                | VK_LWIN
+                | VK_RWIN
+                | VK_LEFT
+                | VK_RIGHT
+                | VK_UP
+                | VK_DOWN
+                | VK_HOME
+                | VK_END
+                | VK_PRIOR
+                | VK_NEXT
+                | VK_INSERT
+                | VK_DELETE
+                | VK_APPS
+                | VK_DIVIDE
+                | VK_NUMLOCK
+                | VK_SNAPSHOT
+                | VK_VOLUME_MUTE
+                | VK_VOLUME_DOWN
+                | VK_VOLUME_UP
+                | VK_MEDIA_NEXT_TRACK
+                | VK_MEDIA_PREV_TRACK
+                | VK_MEDIA_STOP
+                | VK_MEDIA_PLAY_PAUSE
+        );
     Ok((code, if extended { KEYEVENTF_EXTENDEDKEY } else { 0 }))
 }
 
@@ -471,6 +558,36 @@ mod tests {
     use crate::core::scenario::TimedEvent;
 
     #[test]
+    fn playback_maps_function_and_numeric_keypad_keys() {
+        assert_eq!(keyboard_code("F1").unwrap(), (VK_F1, 0));
+        assert_eq!(keyboard_code("F24").unwrap(), (VK_F24, 0));
+        assert_eq!(keyboard_code("Numpad1").unwrap(), (VK_NUMPAD1, 0));
+        assert_eq!(
+            keyboard_code("NumpadEnter").unwrap(),
+            (VK_RETURN, KEYEVENTF_EXTENDEDKEY)
+        );
+        assert_eq!(
+            keyboard_code("NumpadDivide").unwrap(),
+            (VK_DIVIDE, KEYEVENTF_EXTENDEDKEY)
+        );
+        assert_eq!(keyboard_code("Backspace").unwrap(), (VK_BACK, 0));
+        assert_eq!(
+            keyboard_code("ArrowUp").unwrap(),
+            (VK_UP, KEYEVENTF_EXTENDEDKEY)
+        );
+        assert_eq!(keyboard_code("Space").unwrap(), (VK_SPACE, 0));
+    }
+
+    #[test]
+    fn playback_uses_short_letter_and_digit_names() {
+        assert_eq!(keyboard_code("A").unwrap(), (u16::from(b'A'), 0));
+        assert_eq!(keyboard_code("1").unwrap(), (u16::from(b'1'), 0));
+        assert_eq!(keyboard_code("Enter").unwrap(), (VK_RETURN, 0));
+        assert!(keyboard_code("KeyA").is_err());
+        assert!(keyboard_code("Digit1").is_err());
+    }
+
+    #[test]
     fn cancellation_during_countdown_prevents_playback() {
         let cancelled = std::cell::Cell::new(false);
         let mut reported = Vec::new();
@@ -549,7 +666,7 @@ mod tests {
             events: vec![
                 TimedEvent {
                     delay_micros: 0,
-                    event: Event::KeyDown { key: "KeyA".into() },
+                    event: Event::KeyDown { key: "A".into() },
                 },
                 TimedEvent {
                     delay_micros: 1,

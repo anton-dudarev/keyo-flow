@@ -200,8 +200,8 @@ fn keyboard_event(message: u32, input: KBDLLHOOKSTRUCT) -> Option<Event> {
         code => code,
     };
     let key = match u8::try_from(code).ok()? {
-        letter @ b'A'..=b'Z' => format!("Key{}", char::from(letter)),
-        digit @ b'0'..=b'9' => format!("Digit{}", char::from(digit)),
+        character @ (b'A'..=b'Z' | b'0'..=b'9') => char::from(character).to_string(),
+        _ if code == VK_RETURN && extended => "NumpadEnter".into(),
         _ => NAMED_KEYS
             .iter()
             .find(|&&(_, value)| code == value)?
@@ -236,7 +236,7 @@ fn mouse_event(message: u32, input: MSLLHOOKSTRUCT, wheel: &mut Wheel) -> Option
             } else {
                 &mut wheel.y
             };
-            // JSON v1 хранит только целые шаги, остаток пригодится при следующем событии.
+            // Формат сценария хранит целые шаги, остаток пригодится при следующем событии.
             let delta = *remainder + i32::from(high_word as i16);
             *remainder = delta % WHEEL_DELTA as i32;
             let steps = i64::from(delta / WHEEL_DELTA as i32);
@@ -275,6 +275,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capture_distinguishes_numeric_keypad_enter_and_supports_function_keys() {
+        for (code, flags, name) in [
+            (VK_RETURN, 0, "Enter"),
+            (VK_RETURN, LLKHF_EXTENDED, "NumpadEnter"),
+            (VK_F12, 0, "F12"),
+            (VK_OEM_COMMA, 0, "Comma"),
+        ] {
+            let input = KBDLLHOOKSTRUCT {
+                vkCode: u32::from(code),
+                flags,
+                ..Default::default()
+            };
+            assert_eq!(
+                keyboard_event(WM_KEYUP, input),
+                Some(Event::KeyUp { key: name.into() })
+            );
+        }
+    }
+    #[test]
+    fn recording_uses_short_digit_names() {
+        let input = KBDLLHOOKSTRUCT {
+            vkCode: u32::from(b'1'),
+            ..Default::default()
+        };
+        assert_eq!(
+            keyboard_event(WM_KEYDOWN, input),
+            Some(Event::KeyDown { key: "1".into() })
+        );
+    }
+
+    #[test]
     fn collecting_closed_input_retains_recorded_events() {
         let (sender, receiver) = mpsc::channel();
         let start = Instant::now();
@@ -293,10 +324,7 @@ mod tests {
         let scenario = collect(receiver).unwrap();
         assert_eq!(scenario.events.len(), 1);
         assert_eq!(scenario.events[0].delay_micros, 20_000);
-        assert_eq!(
-            scenario.events[0].event,
-            Event::KeyDown { key: "KeyA".into() }
-        );
+        assert_eq!(scenario.events[0].event, Event::KeyDown { key: "A".into() });
     }
 
     #[test]

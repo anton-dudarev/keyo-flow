@@ -92,8 +92,8 @@ fn json_preserves_all_event_kinds_in_order() {
                 button: MouseButton::Left,
             },
             Event::Scroll { x: 0, y: -3 },
-            Event::KeyDown { key: "KeyC".into() },
-            Event::KeyUp { key: "KeyC".into() },
+            Event::KeyDown { key: "C".into() },
+            Event::KeyUp { key: "C".into() },
         ]
         .into_iter()
         .enumerate()
@@ -108,16 +108,19 @@ fn json_preserves_all_event_kinds_in_order() {
     write_json(&mut json, &scenario).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
 
-    assert_eq!(value["version"], 1);
+    assert_eq!(value["version"], 2);
     assert_eq!(read_json(json.as_slice()).unwrap(), scenario);
 }
 
 #[test]
 fn json_rejects_unknown_versions() {
-    let json = br#"{"version":2,"events":[]}"#;
-    let error = read_json(json.as_slice()).unwrap_err();
-
-    assert!(error.to_string().contains("unsupported scenario version"));
+    for json in [
+        br#"{"version":1,"events":[]}"#,
+        br#"{"version":3,"events":[]}"#,
+    ] {
+        let error = read_json(json.as_slice()).unwrap_err();
+        assert!(error.to_string().contains("unsupported scenario version"));
+    }
 }
 
 mod playback {
@@ -200,7 +203,7 @@ mod playback {
 
     #[test]
     fn stop_releases_held_key_and_mouse_button_in_reverse_order() {
-        let key = String::from("KeyA");
+        let key = String::from("A");
         let button = MouseButton::Left;
         let down = Event::KeyDown { key: key.clone() };
         let mouse_down = Event::MouseDown { button };

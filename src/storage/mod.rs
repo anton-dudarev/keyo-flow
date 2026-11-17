@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::scenario::{Scenario, TimedEvent};
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Serialize)]
 struct ScenarioOutput<'a> {
@@ -105,7 +105,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("keyo-replace-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let path = dir.join("scenario.json");
-        let original = b"{\"version\":1,\"events\":[]}";
+        let original = b"{\"version\":2,\"events\":[]}";
         fs::write(&path, original).unwrap();
         let result = write_replacement(&path, |writer| {
             writer.write_all(b"incomplete")?;

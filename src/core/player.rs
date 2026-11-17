@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn infinite_playback_can_stop_in_the_middle_of_a_delay() {
-        let key = String::from("KeyA");
+        let key = String::from("A");
         let down = Event::KeyDown { key: key.clone() };
         let (sender, receiver) = mpsc::channel();
         let playback = play_with_options(

@@ -1,7 +1,7 @@
 use eframe::egui::{self, Align, RichText};
 
 use crate::core::scenario::{Event, MouseButton, Scenario, TimedEvent};
-use crate::platform::windows::validate_event;
+use crate::platform::windows::{key_names, validate_event};
 
 use super::{close_dialog, CloseDecision};
 
@@ -20,7 +20,7 @@ pub(super) struct Editor {
     selected: usize,
     delay: String,
     error: Option<String>,
-    adding: Option<NewPosition>,
+    form: Option<PositionForm>,
     reveal: Option<usize>,
     close_prompt: bool,
 }
@@ -33,7 +33,7 @@ impl Editor {
             selected: 0,
             delay: String::new(),
             error: None,
-            adding: None,
+            form: None,
             reveal: None,
             close_prompt: false,
         };
@@ -52,7 +52,7 @@ impl Editor {
     }
 
     pub(super) fn can_apply(&self) -> bool {
-        self.adding.is_none()
+        self.form.is_none()
             && (self.scenario.events.is_empty() || parse_delay(&self.delay).is_some())
     }
 
@@ -66,6 +66,26 @@ impl Editor {
         self.changed = true;
         self.select(index);
         self.reveal = Some(index);
+    }
+
+    fn begin_edit(&mut self, index: usize) {
+        self.select(index);
+        self.form = Some(PositionForm {
+            position: PositionFields::from_event(&self.scenario.events[index]),
+            replace: Some(index),
+        });
+    }
+
+    fn apply_position(&mut self, event: TimedEvent) {
+        let form = self.form.take().unwrap();
+        if let Some(index) = form.replace {
+            let previous = &mut self.scenario.events[index];
+            self.changed |= *previous != event;
+            *previous = event;
+            self.select(index);
+        } else {
+            self.insert_after_selection(event);
+        }
     }
 
     pub(super) fn show_save_error(&mut self, message: String) {
@@ -148,7 +168,7 @@ impl Editor {
                     },
                 );
             });
-        let controls_height = if self.adding.is_some() { 125.0 } else { 70.0 };
+        let controls_height = if self.form.is_some() { 125.0 } else { 70.0 };
         egui::Panel::bottom("editor-controls")
             .exact_size(controls_height)
             .show(ui, |ui| {
@@ -164,24 +184,26 @@ impl Editor {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        if let Some(new) = &mut self.adding {
-            new.fields(ui);
-            let (insert, cancel) = ui
+        if let Some(form) = &mut self.form {
+            form.position.fields(ui);
+            let (apply, cancel) = if form.replace.is_some() {
+                ("Применить", "Отменить правку")
+            } else {
+                ("Добавить", "Отменить добавление")
+            };
+            let (result, cancelled) = ui
                 .horizontal(|ui| {
                     (
-                        ui.button("Добавить").clicked().then(|| new.event()),
-                        ui.button("Отменить добавление").clicked(),
+                        ui.button(apply).clicked().then(|| form.position.event()),
+                        ui.button(cancel).clicked(),
                     )
                 })
                 .inner;
-            match insert {
-                Some(Ok(event)) => {
-                    self.insert_after_selection(event);
-                    self.adding = None;
-                }
+            match result {
+                Some(Ok(event)) => self.apply_position(event),
                 Some(Err(error)) => self.error = Some(error),
-                None if cancel => {
-                    self.adding = None;
+                None if cancelled => {
+                    self.form = None;
                     self.error = None;
                 }
                 None => {}
@@ -190,7 +212,7 @@ impl Editor {
         }
         ui.horizontal(|ui| {
             if ui.button("Добавить позицию").clicked() {
-                self.adding = Some(NewPosition::default());
+                self.form = Some(PositionForm::default());
                 self.error = None;
             }
             if self.scenario.events.is_empty() {
@@ -212,6 +234,9 @@ impl Editor {
                         "Задержка должна быть неотрицательной, до трёх дробных знаков.".into(),
                     );
                 }
+            }
+            if ui.button("Изменить").clicked() {
+                self.begin_edit(self.selected);
             }
             if ui.button("Удалить событие").clicked() {
                 if self.scenario.remove_event(self.selected) {
@@ -235,6 +260,7 @@ impl Editor {
         }
         let mut selected = None;
         let mut moved = None;
+        let mut editing = None;
         let mut list = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if let Some(row) = self.reveal.take() {
             list = list.vertical_scroll_offset(row.saturating_sub(2) as f32 * ROW_HEIGHT);
@@ -274,10 +300,12 @@ impl Editor {
                         .sense(egui::Sense::click_and_drag())
                         .truncate(),
                 );
-                if self.adding.is_some() {
+                if self.form.is_some() {
                     continue;
                 }
-                if response.clicked() {
+                if response.double_clicked() {
+                    editing = Some(index);
+                } else if response.clicked() {
                     selected = Some(index);
                 }
                 response.dnd_set_drag_payload(index);
@@ -301,7 +329,9 @@ impl Editor {
                 }
             }
         });
-        if let Some((from, boundary)) = moved {
+        if let Some(index) = editing {
+            self.begin_edit(index);
+        } else if let Some((from, boundary)) = moved {
             if let Some(index) = self.scenario.move_event(from, boundary) {
                 self.changed = true;
                 self.select(index);
@@ -345,29 +375,73 @@ impl ActionKind {
     }
 }
 
-struct NewPosition {
+#[derive(Default)]
+struct PositionForm {
+    position: PositionFields,
+    replace: Option<usize>,
+}
+
+struct PositionFields {
     kind: ActionKind,
-    x: i32,
-    y: i32,
+    x: i64,
+    y: i64,
     button: MouseButton,
     key: String,
+    key_search: String,
     delay: String,
 }
 
-impl Default for NewPosition {
+impl Default for PositionFields {
     fn default() -> Self {
         Self {
             kind: ActionKind::Move,
             x: 0,
             y: 0,
             button: MouseButton::Left,
-            key: "KeyA".into(),
+            key: "A".into(),
+            key_search: String::new(),
             delay: "0".into(),
         }
     }
 }
 
-impl NewPosition {
+impl PositionFields {
+    fn from_event(timed: &TimedEvent) -> Self {
+        let mut position = Self {
+            delay: format_delay(timed.delay_micros),
+            ..Self::default()
+        };
+        position.kind = match &timed.event {
+            Event::MouseMove { x, y } => {
+                position.x = i64::from(*x);
+                position.y = i64::from(*y);
+                ActionKind::Move
+            }
+            Event::MouseDown { button } | Event::MouseUp { button } => {
+                position.button = *button;
+                if matches!(timed.event, Event::MouseDown { .. }) {
+                    ActionKind::MouseDown
+                } else {
+                    ActionKind::MouseUp
+                }
+            }
+            Event::Scroll { x, y } => {
+                position.x = *x;
+                position.y = *y;
+                ActionKind::Scroll
+            }
+            Event::KeyDown { key } | Event::KeyUp { key } => {
+                position.key.clone_from(key);
+                if matches!(timed.event, Event::KeyDown { .. }) {
+                    ActionKind::KeyDown
+                } else {
+                    ActionKind::KeyUp
+                }
+            }
+        };
+        position
+    }
+
     fn fields(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             egui::ComboBox::from_label("Действие")
@@ -409,17 +483,59 @@ impl NewPosition {
                 let label = ui.label("Клавиша");
                 ui.add(egui::TextEdit::singleline(&mut self.key).desired_width(120.0))
                     .labelled_by(label.id);
-                ui.label("Например, KeyA или Enter");
+                self.key_picker(ui);
             }
         });
+    }
+
+    fn key_picker(&mut self, ui: &mut egui::Ui) {
+        egui::ComboBox::from_id_salt("key-picker")
+            .selected_text("Выбрать клавишу")
+            .height(265.0)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                let search_changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.key_search).hint_text("Поиск клавиши"),
+                    )
+                    .changed();
+                let query = self.key_search.trim().to_lowercase();
+                let mut results = egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .auto_shrink([true, false]);
+                if search_changed {
+                    results = results.vertical_scroll_offset(0.0);
+                }
+                results.show(ui, |ui| {
+                    let mut found = false;
+                    for name in key_names() {
+                        let label = key_label(name);
+                        if !query.is_empty() && !label.to_lowercase().contains(&query) {
+                            continue;
+                        }
+                        found = true;
+                        if ui
+                            .selectable_label(self.key.eq_ignore_ascii_case(name), label)
+                            .clicked()
+                        {
+                            self.key = name.into();
+                            self.key_search.clear();
+                            ui.close();
+                        }
+                    }
+                    if !found {
+                        ui.label("Клавиши не найдены");
+                    }
+                });
+            });
     }
 
     fn to_timed_event(&self) -> Result<TimedEvent, String> {
         let delay_micros = parse_delay(&self.delay).ok_or("Проверь задержку в миллисекундах.")?;
         let event = match self.kind {
             ActionKind::Move => Event::MouseMove {
-                x: self.x,
-                y: self.y,
+                x: i32::try_from(self.x).map_err(|_| "Координата X вне допустимого диапазона.")?,
+                y: i32::try_from(self.y).map_err(|_| "Координата Y вне допустимого диапазона.")?,
             },
             ActionKind::MouseDown => Event::MouseDown {
                 button: self.button,
@@ -428,15 +544,21 @@ impl NewPosition {
                 button: self.button,
             },
             ActionKind::Scroll => Event::Scroll {
-                x: i64::from(self.x),
-                y: i64::from(self.y),
+                x: self.x,
+                y: self.y,
             },
-            ActionKind::KeyDown => Event::KeyDown {
-                key: self.key.trim().into(),
-            },
-            ActionKind::KeyUp => Event::KeyUp {
-                key: self.key.trim().into(),
-            },
+            ActionKind::KeyDown | ActionKind::KeyUp => {
+                let name = self.key.trim();
+                let key = key_names()
+                    .find(|candidate| candidate.eq_ignore_ascii_case(name))
+                    .unwrap_or(name)
+                    .to_owned();
+                if self.kind == ActionKind::KeyDown {
+                    Event::KeyDown { key }
+                } else {
+                    Event::KeyUp { key }
+                }
+            }
         };
         Ok(TimedEvent {
             delay_micros,
@@ -448,6 +570,23 @@ impl NewPosition {
         let event = self.to_timed_event()?;
         validate_event(&event.event).map_err(|error| error.to_string())?;
         Ok(event)
+    }
+}
+
+fn key_label(name: &str) -> &str {
+    match name {
+        "Space" => "Space · Пробел",
+        "Backspace" => "Backspace · Удалить слева",
+        "Delete" => "Delete · Удалить справа",
+        "Enter" => "Enter · Ввод",
+        "ArrowUp" => "ArrowUp · Стрелка вверх",
+        "ArrowDown" => "ArrowDown · Стрелка вниз",
+        "ArrowLeft" => "ArrowLeft · Стрелка влево",
+        "ArrowRight" => "ArrowRight · Стрелка вправо",
+        "ControlLeft" => "ControlLeft · Левый Ctrl",
+        "ControlRight" => "ControlRight · Правый Ctrl",
+        "Escape" => "Escape · Esc",
+        _ => name,
     }
 }
 
@@ -501,6 +640,218 @@ fn button_name(button: MouseButton) -> String {
 mod tests {
     use super::*;
 
+    fn frame(
+        context: &egui::Context,
+        editor: &mut Editor,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    EDITOR_SIZE.into(),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                editor.draw(ui);
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn point(output: &egui::FullOutput, prefix: &str, lower_half: bool) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                text.galley.text().starts_with(prefix).then(|| {
+                    let bounds = text.visual_bounding_rect();
+                    if lower_half {
+                        bounds.center_bottom()
+                    } else {
+                        bounds.center()
+                    }
+                })
+            })
+            .unwrap()
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn key_picker_keeps_list_height_after_clearing_search() {
+        let context = egui::Context::default();
+        let mut editor = Editor::new(Scenario { events: vec![] });
+        editor.form = Some(PositionForm {
+            position: PositionFields {
+                kind: ActionKind::KeyDown,
+                key_search: "MediaStop".into(),
+                ..Default::default()
+            },
+            replace: None,
+        });
+        let output = frame(&context, &mut editor, vec![]);
+        let picker = point(&output, "Выбрать клавишу", false);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(picker)],
+        );
+        frame(&context, &mut editor, vec![button(picker, true)]);
+        frame(&context, &mut editor, vec![button(picker, false)]);
+        let output = frame(&context, &mut editor, vec![]);
+        let result_height = |output: &egui::FullOutput, name: &str| {
+            output
+                .shapes
+                .iter()
+                .rev()
+                .find_map(|clipped| {
+                    let egui::epaint::Shape::Text(text) = &clipped.shape else {
+                        return None;
+                    };
+                    (text.galley.text() == name).then_some(clipped.clip_rect.height())
+                })
+                .unwrap()
+        };
+        let filtered_height = result_height(&output, "MediaStop");
+        editor.form.as_mut().unwrap().position.key_search.clear();
+        let output = frame(&context, &mut editor, vec![]);
+        let cleared_height = result_height(&output, "B");
+        assert!(
+            filtered_height >= 180.0,
+            "Высота после фильтрации: {filtered_height}"
+        );
+        assert!(
+            cleared_height >= 180.0,
+            "Высота после очистки: {cleared_height}"
+        );
+    }
+
+    #[test]
+    fn key_picker_selects_a_function_key_from_search_results() {
+        let context = egui::Context::default();
+        let mut editor = Editor::new(Scenario { events: vec![] });
+        editor.form = Some(PositionForm {
+            position: PositionFields {
+                kind: ActionKind::KeyDown,
+                key_search: "f12".into(),
+                ..Default::default()
+            },
+            replace: None,
+        });
+        let output = frame(&context, &mut editor, vec![]);
+        let picker = point(&output, "Выбрать клавишу", false);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(picker)],
+        );
+        frame(&context, &mut editor, vec![button(picker, true)]);
+        frame(&context, &mut editor, vec![button(picker, false)]);
+        let output = frame(&context, &mut editor, vec![]);
+        let result = point(&output, "F12", false);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(result)],
+        );
+        frame(&context, &mut editor, vec![button(result, true)]);
+        frame(&context, &mut editor, vec![button(result, false)]);
+        assert_eq!(editor.form.unwrap().position.key, "F12");
+    }
+
+    #[test]
+    fn double_click_opens_existing_values_and_cancel_discards_form_changes() {
+        let context = egui::Context::default();
+        let original = TimedEvent {
+            delay_micros: 2500,
+            event: Event::KeyUp { key: "1".into() },
+        };
+        let mut editor = Editor::new(Scenario {
+            events: vec![original.clone()],
+        });
+        let output = frame(&context, &mut editor, vec![]);
+        let row = point(&output, "1   ", false);
+        frame(&context, &mut editor, vec![egui::Event::PointerMoved(row)]);
+        for click in 0..2 {
+            frame(&context, &mut editor, vec![button(row, true)]);
+            frame(&context, &mut editor, vec![button(row, false)]);
+            assert_eq!(editor.form.is_some(), click == 1);
+        }
+        let form = editor.form.as_mut().unwrap();
+        assert_eq!(form.position.to_timed_event().unwrap(), original);
+        form.position.key = "2".into();
+
+        let output = frame(&context, &mut editor, vec![]);
+        let cancel = point(&output, "Отменить правку", false);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(cancel)],
+        );
+        frame(&context, &mut editor, vec![button(cancel, true)]);
+        frame(&context, &mut editor, vec![button(cancel, false)]);
+        assert!(editor.form.is_none());
+        assert_eq!(editor.scenario.events, [original]);
+        assert!(!editor.changed);
+    }
+
+    #[test]
+    fn editing_replaces_the_selected_position_without_reordering() {
+        let original = TimedEvent {
+            delay_micros: 3750,
+            event: Event::Scroll { x: -2, y: 3 },
+        };
+        let mut editor = Editor::new(Scenario {
+            events: vec![original.clone(), original.clone()],
+        });
+        editor.begin_edit(1);
+        let form = editor.form.as_mut().unwrap();
+        assert_eq!(form.position.to_timed_event().unwrap(), original);
+        form.position.y = -6;
+        let updated = form.position.to_timed_event().unwrap();
+        editor.apply_position(updated.clone());
+        assert_eq!(editor.scenario.events, [original, updated]);
+        assert_eq!(editor.selected, 1);
+        assert!(editor.changed);
+    }
+
+    #[test]
+    fn editor_normalizes_single_latin_letters() {
+        for (entered, expected) in [
+            (" a ", "A"),
+            ("1", "1"),
+            ("Enter", "Enter"),
+            ("space", "Space"),
+            ("f12", "F12"),
+        ] {
+            let position = PositionFields {
+                kind: ActionKind::KeyDown,
+                key: entered.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                position.to_timed_event().unwrap().event,
+                Event::KeyDown {
+                    key: expected.into()
+                }
+            );
+        }
+    }
+
     #[test]
     fn delay_input_preserves_microsecond_precision_and_rejects_overflow() {
         for micros in [0, 1, 11, 1_001, 1_100, u64::MAX] {
@@ -514,7 +865,7 @@ mod tests {
 
     #[test]
     fn position_is_inserted_below_selection_and_is_selected() {
-        let position = NewPosition {
+        let position = PositionFields {
             kind: ActionKind::KeyDown,
             delay: "1,25".into(),
             ..Default::default()
@@ -549,55 +900,21 @@ mod tests {
                 })
                 .collect(),
         });
-        let frame = |editor: &mut Editor, events| {
-            let mut output = context.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        EDITOR_SIZE.into(),
-                    )),
-                    events,
-                    ..Default::default()
-                },
-                |ui| {
-                    editor.draw(ui);
-                },
-            );
-            output.textures_delta.clear();
-            output
-        };
-        let output = frame(&mut editor, vec![]);
-        let point = |prefix: &str, lower_half: bool| {
-            output
-                .shapes
-                .iter()
-                .find_map(|clipped| {
-                    let egui::epaint::Shape::Text(text) = &clipped.shape else {
-                        return None;
-                    };
-                    text.galley.text().starts_with(prefix).then(|| {
-                        let bounds = text.visual_bounding_rect();
-                        if lower_half {
-                            bounds.center_bottom()
-                        } else {
-                            bounds.center()
-                        }
-                    })
-                })
-                .unwrap()
-        };
-        let origin = point("1   ", false);
-        let target = point("3   ", true);
-        let button = |pos, pressed| egui::Event::PointerButton {
-            pos,
-            pressed,
-            button: egui::PointerButton::Primary,
-            modifiers: egui::Modifiers::NONE,
-        };
-        frame(&mut editor, vec![egui::Event::PointerMoved(origin)]);
-        frame(&mut editor, vec![button(origin, true)]);
-        frame(&mut editor, vec![egui::Event::PointerMoved(target)]);
-        frame(&mut editor, vec![button(target, false)]);
+        let output = frame(&context, &mut editor, vec![]);
+        let origin = point(&output, "1   ", false);
+        let target = point(&output, "3   ", true);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(origin)],
+        );
+        frame(&context, &mut editor, vec![button(origin, true)]);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(target)],
+        );
+        frame(&context, &mut editor, vec![button(target, false)]);
         assert_eq!(
             editor
                 .scenario
