@@ -113,11 +113,7 @@ impl Loaded {
     }
 
     fn duration_of(scenario: &Scenario) -> Duration {
-        scenario.events.iter().fold(Duration::ZERO, |total, event| {
-            total
-                .saturating_add(Duration::from_micros(event.delay_micros))
-                .saturating_add(Duration::from_micros(event.event.duration_micros()))
-        })
+        Duration::from_micros(u64::try_from(scenario.duration_micros()).unwrap_or(u64::MAX))
     }
 }
 

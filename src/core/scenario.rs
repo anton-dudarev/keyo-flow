@@ -32,6 +32,16 @@ impl Scenario {
     pub(crate) fn validate_motion(&self) -> std::io::Result<()> {
         let mut has_position = false;
         for (index, timed) in self.events.iter().enumerate() {
+            if let Event::MousePath { points } = &timed.event {
+                if points.is_empty()
+                    || points[0].offset_micros != 0
+                    || points
+                        .windows(2)
+                        .any(|pair| pair[0].offset_micros > pair[1].offset_micros)
+                {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Траектория должна начинаться с нулевого времени и содержать точки в порядке времени"));
+                }
+            }
             if matches!(timed.event, Event::MouseMoveSmooth { .. }) && !has_position {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -107,6 +117,13 @@ pub struct TimedEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MousePoint {
+    pub offset_micros: u64,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// Физические пиксели рабочего стола или доли окна в миллионных.
@@ -119,11 +136,20 @@ pub enum Event {
         y: i32,
         duration_ms: NonZeroU32,
     },
+    MousePath {
+        points: Vec<MousePoint>,
+    },
     MouseDown {
         button: MouseButton,
     },
     MouseUp {
         button: MouseButton,
+    },
+    MouseHold {
+        button: MouseButton,
+        duration_micros: u64,
+        #[serde(default)]
+        release_order: u64,
     },
     Scroll {
         x: i64,
@@ -136,12 +162,24 @@ pub enum Event {
     KeyUp {
         key: String,
     },
+    KeyHold {
+        key: String,
+        duration_micros: u64,
+    },
+    /// Удержание на временной шкале. Следующая задержка отсчитывается от его начала.
+    KeySpan {
+        key: String,
+        duration_micros: u64,
+        #[serde(default)]
+        release_order: u64,
+    },
 }
 
 impl Event {
     pub(crate) fn pointer_position(&self) -> Option<(i32, i32)> {
         match *self {
             Self::MouseMove { x, y } | Self::MouseMoveSmooth { x, y, .. } => Some((x, y)),
+            Self::MousePath { ref points } => points.last().map(|point| (point.x, point.y)),
             _ => None,
         }
     }
@@ -149,12 +187,16 @@ impl Event {
     pub(crate) fn duration_micros(&self) -> u64 {
         match *self {
             Self::MouseMoveSmooth { duration_ms, .. } => u64::from(duration_ms.get()) * 1000,
+            Self::KeyHold {
+                duration_micros, ..
+            } => duration_micros,
+            Self::MousePath { ref points } => points.last().map_or(0, |point| point.offset_micros),
             _ => 0,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseButton {
     Left,

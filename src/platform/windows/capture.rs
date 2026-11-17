@@ -125,6 +125,7 @@ fn collect(receiver: mpsc::Receiver<Packet>) -> Option<Scenario> {
         if let Some(modifiers) = stop_modifiers {
             remove_stop_modifiers(&mut scenario, modifiers);
         }
+        crate::core::timeline::compact(&mut scenario);
         scenario
     })
 }
@@ -461,6 +462,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recording_combines_adjacent_keys_and_preserves_overlapping_actions() {
+        let (sender, receiver) = mpsc::channel();
+        let start = Instant::now();
+        sender
+            .send(Packet::Started(start, CoordinateSpace::Desktop))
+            .unwrap();
+        for (micros, message, code) in [
+            (700, WM_KEYDOWN, u32::from(b'A')),
+            (50_825, WM_KEYUP, u32::from(b'A')),
+            (51_000, WM_KEYDOWN, u32::from(VK_LCONTROL)),
+            (52_000, WM_KEYDOWN, u32::from(b'C')),
+            (53_000, WM_KEYUP, u32::from(b'C')),
+            (54_000, WM_KEYUP, u32::from(VK_LCONTROL)),
+        ] {
+            sender
+                .send(Packet::Keyboard(
+                    start + Duration::from_micros(micros),
+                    message,
+                    KBDLLHOOKSTRUCT {
+                        vkCode: code,
+                        ..Default::default()
+                    },
+                ))
+                .unwrap();
+        }
+        drop(sender);
+        let scenario = collect(receiver).unwrap();
+        let events = &scenario.events;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].delay_micros, 700);
+        assert_eq!(
+            events[0].event,
+            Event::KeySpan {
+                key: "A".into(),
+                duration_micros: 50_125,
+                release_order: 0,
+            }
+        );
+        assert_eq!(events[1].delay_micros, 50_300);
+        assert_eq!(
+            events[1].event,
+            Event::KeySpan {
+                key: "ControlLeft".into(),
+                duration_micros: 3000,
+                release_order: 0,
+            }
+        );
+        assert_eq!(
+            events[2].event,
+            Event::KeySpan {
+                key: "C".into(),
+                duration_micros: 1000,
+                release_order: 0,
+            }
+        );
+        assert_eq!(scenario.duration_micros(), 54_000);
+    }
+
+    #[test]
     fn configured_win_shortcut_stops_only_on_a_fresh_press_with_matching_modifiers() {
         let mut shortcut = StopShortcut {
             chord: Chord {
@@ -527,26 +587,18 @@ mod tests {
             [
                 (
                     1000,
-                    Event::KeyDown {
-                        key: "ControlLeft".into()
+                    Event::KeySpan {
+                        key: "ControlLeft".into(),
+                        duration_micros: 3000,
+                        release_order: 0,
                     }
                 ),
                 (
                     1000,
-                    Event::KeyDown {
-                        key: "Escape".into()
-                    }
-                ),
-                (
-                    1000,
-                    Event::KeyUp {
-                        key: "Escape".into()
-                    }
-                ),
-                (
-                    1000,
-                    Event::KeyUp {
-                        key: "ControlLeft".into()
+                    Event::KeySpan {
+                        key: "Escape".into(),
+                        duration_micros: 1000,
+                        release_order: 0,
                     }
                 ),
             ]

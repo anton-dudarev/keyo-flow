@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::scenario::{CoordinateSpace, Scenario, TimedEvent};
+use crate::core::scenario::{CoordinateSpace, Event, Scenario, TimedEvent};
 
 #[derive(Serialize)]
 struct ScenarioOutput<'a> {
@@ -68,6 +68,11 @@ pub fn write_json(writer: impl Write, scenario: &Scenario) -> serde_json::Result
 
 fn validate_coordinates(scenario: &Scenario) -> Result<(), &'static str> {
     for timed in &scenario.events {
+        if let Event::MousePath { points } = &timed.event {
+            for point in points {
+                scenario.coordinates.validate_point(point.x, point.y)?;
+            }
+        }
         if let Some((x, y)) = timed.event.pointer_position() {
             scenario.coordinates.validate_point(x, y)?;
         }

@@ -225,6 +225,7 @@ pub fn enable_dpi_awareness() -> io::Result<()> {
 
 fn validate(scenario: &Scenario, desktop: Desktop) -> io::Result<()> {
     scenario.validate_motion()?;
+    let scenario = scenario.expand_recorded()?;
     let mut duration = Duration::ZERO;
     let start = Instant::now();
     for (index, timed) in scenario.events.iter().enumerate() {
@@ -277,8 +278,10 @@ impl Desktop {
                 ),
                 None,
             ),
-            Event::MouseDown { button } | Event::MouseUp { button } => {
-                let down = matches!(event, Event::MouseDown { .. });
+            Event::MouseDown { button }
+            | Event::MouseUp { button }
+            | Event::MouseHold { button, .. } => {
+                let down = matches!(event, Event::MouseDown { .. } | Event::MouseHold { .. });
                 let (press, release, data) = match button {
                     MouseButton::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0),
                     MouseButton::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0),
@@ -298,7 +301,13 @@ impl Desktop {
                 }
                 (vertical, (*x != 0).then_some(horizontal))
             }
-            Event::KeyDown { key } | Event::KeyUp { key } => {
+            Event::MousePath { .. } => {
+                return Err(invalid("Перед отправкой траекторию нужно раскрыть"))
+            }
+            Event::KeyDown { key }
+            | Event::KeyUp { key }
+            | Event::KeyHold { key, .. }
+            | Event::KeySpan { key, .. } => {
                 let (code, mut flags) = keyboard_code(key)?;
                 if matches!(event, Event::KeyUp { .. }) {
                     flags |= KEYEVENTF_KEYUP;

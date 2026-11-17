@@ -49,11 +49,7 @@ impl PlaybackOptions {
             ));
         }
         scenario.validate_motion()?;
-        let total = scenario
-            .events
-            .iter()
-            .map(|event| u128::from(event.delay_micros) + u128::from(event.event.duration_micros()))
-            .sum();
+        let total = scenario.duration_micros();
         target_time(Instant::now(), total, self.speed)?;
         Ok(())
     }
@@ -126,6 +122,7 @@ pub(crate) fn play_with_guard(
     mut send: impl FnMut(&Event) -> io::Result<()> + Send + 'static,
 ) -> io::Result<Playback> {
     options.validate(&scenario)?;
+    let scenario = scenario.expand_recorded()?;
 
     let (sender, result) = mpsc::channel();
     let stopped = Arc::new(AtomicBool::new(false));
@@ -174,34 +171,16 @@ fn run(
             started_at: start,
         });
         let mut elapsed_micros = 0;
-        let mut position = None;
         let mut input = PressedInputGuard::new(send);
-        let mut send_at = |elapsed, event: &Event| -> io::Result<bool> {
-            let deadline = target_time(start, elapsed, options.speed)?;
-            if !wait_until(deadline, stopped) {
-                return Ok(false);
-            }
-            before_event(event)?;
-            input.send(event)?;
-            Ok(true)
-        };
         for timed in &scenario.events {
             elapsed_micros += u128::from(timed.delay_micros);
-            if let Event::MouseMoveSmooth { x, y, .. } = timed.event {
-                let from = position.expect("Перед плавным перемещением проверена начальная точка");
-                let duration = timed.event.duration_micros();
-                for (offset, event) in smooth_steps(from, (x, y), duration) {
-                    if !send_at(elapsed_micros + u128::from(offset), &event)? {
-                        input.release_all()?;
-                        return Ok(PlaybackOutcome::Stopped);
-                    }
-                }
-                elapsed_micros += u128::from(duration);
-            } else if !send_at(elapsed_micros, &timed.event)? {
+            let deadline = target_time(start, elapsed_micros, options.speed)?;
+            if !wait_until(deadline, stopped) {
                 input.release_all()?;
                 return Ok(PlaybackOutcome::Stopped);
             }
-            position = timed.event.pointer_position().or(position);
+            before_event(&timed.event)?;
+            input.send(&timed.event)?;
         }
         input.release_all()?;
         if matches!(options.repeats, RepeatMode::Count(count) if number == u64::from(count)) {
@@ -212,30 +191,6 @@ fn run(
         }
     }
     Ok(PlaybackOutcome::Stopped)
-}
-
-fn smooth_steps(
-    from: (i32, i32),
-    to: (i32, i32),
-    duration: u64,
-) -> impl Iterator<Item = (u64, Event)> {
-    // shortcut: длинный путь ограничен 600 шагами, пересмотри лимит при необходимости более частых шагов.
-    let steps = duration.div_ceil(16_000).min(600);
-    (1..=steps).map(move |step| {
-        let t = step as f64 / steps as f64;
-        let fraction = t * t * (3.0 - 2.0 * t);
-        let interpolate = |start, end| {
-            let start = f64::from(start);
-            (start + (f64::from(end) - start) * fraction).round() as i32
-        };
-        (
-            duration * step / steps,
-            Event::MouseMove {
-                x: interpolate(from.0, to.0),
-                y: interpolate(from.1, to.1),
-            },
-        )
-    })
 }
 
 fn target_time(start: Instant, elapsed_micros: u128, speed: f64) -> io::Result<Instant> {
@@ -265,6 +220,147 @@ fn wait_until(deadline: Instant, stopped: &AtomicBool) -> bool {
 mod tests {
     use super::*;
     use crate::core::scenario::TimedEvent;
+    use crate::core::timeline::smooth_steps;
+
+    #[test]
+    fn stopping_during_a_recorded_mouse_hold_releases_the_button() {
+        use crate::core::scenario::MouseButton;
+        let (sender, receiver) = mpsc::channel();
+        let playback = play(
+            Scenario {
+                coordinates: Default::default(),
+                events: vec![TimedEvent {
+                    delay_micros: 0,
+                    event: Event::MouseHold {
+                        button: MouseButton::Left,
+                        duration_micros: 60_000_000,
+                        release_order: 0,
+                    },
+                }],
+            },
+            1.0,
+            1,
+            move |event| {
+                sender.send(event.clone()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let timeout = Duration::from_secs(3);
+        assert_eq!(
+            receiver.recv_timeout(timeout).unwrap(),
+            Event::MouseDown {
+                button: MouseButton::Left
+            }
+        );
+        playback.stop();
+        assert_eq!(
+            playback.result.recv_timeout(timeout).unwrap().unwrap(),
+            PlaybackOutcome::Stopped
+        );
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<_>>(),
+            [Event::MouseUp {
+                button: MouseButton::Left
+            }]
+        );
+    }
+
+    #[test]
+    fn concurrent_recorded_holds_release_all_pressed_keys_on_stop() {
+        let mut scenario = Scenario {
+            coordinates: Default::default(),
+            events: vec![
+                TimedEvent {
+                    delay_micros: 0,
+                    event: Event::KeyDown { key: "A".into() },
+                },
+                TimedEvent {
+                    delay_micros: 0,
+                    event: Event::KeyDown { key: "B".into() },
+                },
+                TimedEvent {
+                    delay_micros: 60_000_000,
+                    event: Event::KeyUp { key: "A".into() },
+                },
+                TimedEvent {
+                    delay_micros: 0,
+                    event: Event::KeyUp { key: "B".into() },
+                },
+            ],
+        };
+        crate::core::timeline::compact(&mut scenario);
+        let (sender, receiver) = mpsc::channel();
+        let playback = play(scenario, 1.0, 1, move |event| {
+            sender.send(event.clone()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let timeout = Duration::from_secs(3);
+        assert_eq!(
+            receiver.recv_timeout(timeout).unwrap(),
+            Event::KeyDown { key: "A".into() }
+        );
+        assert_eq!(
+            receiver.recv_timeout(timeout).unwrap(),
+            Event::KeyDown { key: "B".into() }
+        );
+        playback.stop();
+        assert_eq!(
+            playback.result.recv_timeout(timeout).unwrap().unwrap(),
+            PlaybackOutcome::Stopped
+        );
+        let mut released: Vec<_> = receiver
+            .try_iter()
+            .map(|event| {
+                let Event::KeyUp { key } = event else {
+                    panic!("Ожидалось отпускание")
+                };
+                key
+            })
+            .collect();
+        released.sort();
+        assert_eq!(released, ["A", "B"]);
+    }
+
+    #[test]
+    fn stopping_during_key_hold_releases_the_key() {
+        let (sender, receiver) = mpsc::channel();
+        let key = String::from("Space");
+        let playback = play(
+            Scenario {
+                coordinates: Default::default(),
+                events: vec![TimedEvent {
+                    delay_micros: 0,
+                    event: Event::KeyHold {
+                        key: key.clone(),
+                        duration_micros: 60_000_000,
+                    },
+                }],
+            },
+            1.0,
+            1,
+            move |event| {
+                sender.send(event.clone()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let timeout = Duration::from_secs(3);
+        assert_eq!(
+            receiver.recv_timeout(timeout).unwrap(),
+            Event::KeyDown { key: key.clone() }
+        );
+        playback.stop();
+        assert_eq!(
+            playback.result.recv_timeout(timeout).unwrap().unwrap(),
+            PlaybackOutcome::Stopped
+        );
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<_>>(),
+            [Event::KeyUp { key }]
+        );
+    }
 
     #[test]
     fn smooth_move_plays_intermediate_points_and_reaches_the_destination() {

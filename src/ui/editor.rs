@@ -15,6 +15,12 @@ pub(super) const EDITOR_SIZE: [f32; 2] = [820.0, 550.0];
 pub(super) const EDITOR_MIN_SIZE: [f32; 2] = [680.0, 360.0];
 const ROW_HEIGHT: f32 = 25.0;
 
+struct PathSelection {
+    path: usize,
+    points: BTreeSet<usize>,
+    anchor: usize,
+}
+
 pub(super) enum EditorAction {
     Apply,
     Cancel,
@@ -33,6 +39,8 @@ pub(super) struct Editor {
     reveal: Option<usize>,
     close_prompt: bool,
     restore_placement: RestorePlacement,
+    expanded_paths: BTreeSet<usize>,
+    path_selection: Option<PathSelection>,
 }
 
 impl Editor {
@@ -49,12 +57,15 @@ impl Editor {
             reveal: None,
             close_prompt: false,
             restore_placement: RestorePlacement::default(),
+            expanded_paths: BTreeSet::new(),
+            path_selection: None,
         };
         editor.select(0);
         editor
     }
 
     fn select(&mut self, index: usize) {
+        self.path_selection = None;
         self.selection.clear();
         if index < self.scenario.events.len() {
             self.selection.insert(index);
@@ -74,6 +85,7 @@ impl Editor {
     }
 
     fn select_with_modifiers(&mut self, index: usize, modifiers: egui::Modifiers) {
+        self.path_selection = None;
         if modifiers.shift {
             if !modifiers.ctrl {
                 self.selection.clear();
@@ -99,10 +111,17 @@ impl Editor {
     }
 
     fn delete_selection(&mut self) {
+        if self.path_selection.is_some() {
+            if let Err(error) = self.delete_path_points() {
+                self.error = Some(error);
+            }
+            return;
+        }
         let Some(&first) = self.selection.first() else {
             return;
         };
         if self.scenario.remove_events(&self.selection) {
+            self.expanded_paths.clear();
             self.changed = true;
             self.select(first.min(self.scenario.events.len().saturating_sub(1)));
         } else {
@@ -122,13 +141,307 @@ impl Editor {
     fn insert_after_selection(&mut self, event: TimedEvent) {
         let index = (self.selected + 1).min(self.scenario.events.len());
         self.scenario.events.insert(index, event);
+        self.expanded_paths.clear();
         self.changed = true;
         self.select(index);
         self.reveal = Some(index);
     }
 
+    fn selected_hold(&self) -> Option<&Event> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let timed = self.scenario.events.get(self.selected)?;
+        matches!(
+            timed.event,
+            Event::KeyHold { .. } | Event::KeySpan { .. } | Event::MouseHold { .. }
+        )
+        .then_some(&timed.event)
+    }
+
+    fn split_selected_hold(&mut self) {
+        let index = self.selected;
+        match self.scenario.expand_row(Some(index)) {
+            Ok(scenario) => self.scenario = scenario,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
+            }
+        }
+        self.changed = true;
+        self.expanded_paths.clear();
+        self.select(index);
+        self.reveal = Some(index);
+    }
+
+    fn selected_hold_pair(&self) -> Option<(usize, usize)> {
+        if self.selection.len() != 2 {
+            return None;
+        }
+        let down = *self.selection.first()?;
+        let up = *self.selection.last()?;
+        match (
+            &self.scenario.events.get(down)?.event,
+            &self.scenario.events.get(up)?.event,
+        ) {
+            (Event::KeyDown { .. }, Event::KeyUp { .. })
+            | (Event::MouseDown { .. }, Event::MouseUp { .. }) => Some((down, up)),
+            _ => None,
+        }
+    }
+
+    fn merge_selected_hold(&mut self) {
+        let Some((down, up)) = self.selected_hold_pair() else {
+            return;
+        };
+        if let Err(error) = self.scenario.merge_hold(down, up) {
+            self.error = Some(error.to_string());
+            return;
+        }
+        self.changed = true;
+        self.expanded_paths.clear();
+        self.select(down);
+        self.reveal = Some(down);
+    }
+
+    fn toggle_path(&mut self, index: usize) {
+        if !self.expanded_paths.remove(&index) {
+            self.expanded_paths.insert(index);
+        } else if self
+            .path_selection
+            .as_ref()
+            .is_some_and(|selection| selection.path == index)
+        {
+            self.select(index);
+        }
+    }
+
+    fn select_path_point(&mut self, path: usize, point: usize, modifiers: egui::Modifiers) {
+        self.selection.clear();
+        self.set_active(path);
+        if self
+            .path_selection
+            .as_ref()
+            .is_none_or(|selection| selection.path != path)
+        {
+            self.path_selection = Some(PathSelection {
+                path,
+                points: BTreeSet::new(),
+                anchor: point,
+            });
+        }
+        let selection = self.path_selection.as_mut().unwrap();
+        if modifiers.shift {
+            if !modifiers.ctrl {
+                selection.points.clear();
+            }
+            selection
+                .points
+                .extend(selection.anchor.min(point)..=selection.anchor.max(point));
+        } else if modifiers.ctrl {
+            selection.anchor = point;
+            if !selection.points.remove(&point) {
+                selection.points.insert(point);
+            }
+        } else {
+            selection.anchor = point;
+            selection.points = BTreeSet::from([point]);
+        }
+    }
+
+    fn delete_path_points(&mut self) -> Result<(), String> {
+        let selection = self.path_selection.as_ref().unwrap();
+        if selection.points.is_empty() {
+            return Ok(());
+        }
+        let index = selection.path;
+        let timed = &self.scenario.events[index];
+        let Event::MousePath { points } = &timed.event else {
+            return Ok(());
+        };
+        let mut remaining: Vec<_> = points
+            .iter()
+            .enumerate()
+            .filter(|(point, _)| !selection.points.contains(point))
+            .map(|(_, point)| point.clone())
+            .collect();
+        let Some(first) = remaining.first() else {
+            self.select(index);
+            self.delete_selection();
+            return Ok(());
+        };
+        let first_offset = first.offset_micros;
+        let delay = timed
+            .delay_micros
+            .checked_add(first_offset)
+            .ok_or("Задержка траектории слишком велика")?;
+        let last_offset = remaining.last().unwrap().offset_micros;
+        let tail = points.last().unwrap().offset_micros - last_offset;
+        let next_delay = self
+            .scenario
+            .events
+            .get(index + 1)
+            .map(|next| {
+                next.delay_micros
+                    .checked_add(tail)
+                    .ok_or("Задержка следующего события слишком велика")
+            })
+            .transpose()?;
+        for point in &mut remaining {
+            point.offset_micros -= first_offset;
+        }
+        self.scenario.events[index] = TimedEvent {
+            delay_micros: delay,
+            event: Event::MousePath { points: remaining },
+        };
+        if let Some(delay) = next_delay {
+            self.scenario.events[index + 1].delay_micros = delay;
+        }
+        self.changed = true;
+        self.select(index);
+        Ok(())
+    }
+
+    fn visible_rows(&self) -> Vec<(usize, Option<usize>)> {
+        let mut rows = Vec::new();
+        for (index, timed) in self.scenario.events.iter().enumerate() {
+            rows.push((index, None));
+            if self.expanded_paths.contains(&index) {
+                if let Event::MousePath { points } = &timed.event {
+                    rows.extend((0..points.len()).map(|point| (index, Some(point))));
+                }
+            }
+        }
+        rows
+    }
+
+    fn edit_path_point(
+        &mut self,
+        index: usize,
+        point: usize,
+        x: i32,
+        y: i32,
+        delay_micros: u64,
+    ) -> Result<(), String> {
+        self.scenario
+            .coordinates
+            .validate_point(x, y)
+            .map_err(str::to_owned)?;
+        let Event::MousePath { points } = &mut self.scenario.events[index].event else {
+            return Err("Выбери точку траектории".into());
+        };
+        let previous = if point == 0 {
+            0
+        } else {
+            points[point - 1].offset_micros
+        };
+        let offset = previous
+            .checked_add(delay_micros)
+            .ok_or("Задержка слишком велика")?;
+        if point == 0 && offset != 0 {
+            return Err("Задержка перед первой точкой задаётся в строке траектории".into());
+        }
+        let shift = i128::from(offset) - i128::from(points[point].offset_micros);
+        let offsets = points[point..]
+            .iter()
+            .map(|point| {
+                u64::try_from(i128::from(point.offset_micros) + shift)
+                    .map_err(|_| "Длительность траектории слишком велика".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.changed |= points[point].x != x || points[point].y != y || shift != 0;
+        points[point].x = x;
+        points[point].y = y;
+        for (point, offset) in points[point..].iter_mut().zip(offsets) {
+            point.offset_micros = offset;
+        }
+        Ok(())
+    }
+
+    fn draw_path_point(&mut self, ui: &mut egui::Ui, index: usize, point_index: usize) -> bool {
+        let Event::MousePath { points } = &self.scenario.events[index].event else {
+            return false;
+        };
+        let point = &points[point_index];
+        let mut x = point.x;
+        let mut y = point.y;
+        let previous = if point_index == 0 {
+            0
+        } else {
+            points[point_index - 1].offset_micros
+        };
+        let mut delay_ms = (point.offset_micros - previous) as f64 / 1000.0;
+        let selected = self.path_selection.as_ref().is_some_and(|selection| {
+            selection.path == index && selection.points.contains(&point_index)
+        });
+        let row_rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), ROW_HEIGHT),
+        );
+        if selected {
+            ui.painter()
+                .rect_filled(row_rect, 3, ui.visuals().selection.bg_fill);
+        }
+        let background = ui.interact(
+            row_rect,
+            ui.scope_id()
+                .with(("select-path-point", index, point_index)),
+            egui::Sense::click(),
+        );
+        let mut clicked = false;
+        let response = ui
+            .push_id(("path-point", index, point_index), |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(ROW_HEIGHT);
+                    ui.add_space(30.0);
+                    clicked |= ui
+                        .selectable_label(selected, format!("Точка {}", point_index + 1))
+                        .clicked();
+                    let label = ui.label("X");
+                    let x_response = ui.add(egui::DragValue::new(&mut x)).labelled_by(label.id);
+                    let label = ui.label("Y");
+                    let y_response = ui.add(egui::DragValue::new(&mut y)).labelled_by(label.id);
+                    let label = ui.label("Задержка, мс");
+                    let delay_response = ui
+                        .add_enabled(
+                            point_index > 0,
+                            egui::DragValue::new(&mut delay_ms)
+                                .range(0.0..=u64::MAX as f64 / 1000.0)
+                                .max_decimals(3)
+                                .speed(0.1),
+                        )
+                        .labelled_by(label.id);
+                    (
+                        x_response.changed() || y_response.changed() || delay_response.changed(),
+                        x_response.has_focus()
+                            || y_response.has_focus()
+                            || delay_response.has_focus(),
+                    )
+                })
+                .inner
+            })
+            .inner;
+        if clicked || background.clicked() {
+            self.select_path_point(index, point_index, ui.input(|input| input.modifiers));
+        }
+        if response.0 {
+            if let Err(error) =
+                self.edit_path_point(index, point_index, x, y, (delay_ms * 1000.0).round() as u64)
+            {
+                self.error = Some(error);
+            } else {
+                self.error = None;
+            }
+        }
+        response.1
+    }
+
     fn begin_edit(&mut self, index: usize) {
         self.select(index);
+        if matches!(self.scenario.events[index].event, Event::MousePath { .. }) {
+            self.toggle_path(index);
+            return;
+        }
         self.form = Some(PositionForm {
             position: PositionFields::from_event(&self.scenario.events[index]),
             replace: Some(index),
@@ -274,14 +587,23 @@ impl Editor {
                     }
                 });
             });
-        egui::CentralPanel::default().show(ui, |ui| self.rows(ui));
+        editing_text |= egui::CentralPanel::default()
+            .show(ui, |ui| self.rows(ui))
+            .inner;
         if !editing_text
             && self.form.is_none()
             && !self.close_prompt
             && !egui::Popup::is_any_open(ui.ctx())
         {
             if ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::A)) {
-                self.selection = (0..self.scenario.events.len()).collect();
+                if let Some(selection) = &mut self.path_selection {
+                    if let Event::MousePath { points } = &self.scenario.events[selection.path].event
+                    {
+                        selection.points = (0..points.len()).collect();
+                    }
+                } else {
+                    self.selection = (0..self.scenario.events.len()).collect();
+                }
                 ui.ctx().request_repaint();
             }
             if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
@@ -322,70 +644,116 @@ impl Editor {
             }
             return true;
         }
-        ui.horizontal(|ui| {
-            if ui.button("Добавить позицию").clicked() {
-                self.form = Some(PositionForm::default());
-                self.error = None;
-            }
-            if self.scenario.events.is_empty() {
-                return false;
-            }
-            let label = ui.label("Задержка, мс");
-            let delay = ui
-                .add_enabled(
-                    !self.selection.is_empty(),
-                    egui::TextEdit::singleline(&mut self.delay).desired_width(118.0),
-                )
-                .labelled_by(label.id);
-            if delay.changed() {
-                if let Some(delay) = parse_delay(&self.delay) {
-                    let event = &mut self.scenario.events[self.selected];
-                    self.changed |= event.delay_micros != delay;
-                    event.delay_micros = delay;
+        let edit_has_focus = ui
+            .horizontal(|ui| {
+                if ui.button("Добавить позицию").clicked() {
+                    self.form = Some(PositionForm::default());
                     self.error = None;
-                } else {
-                    self.error = Some(
-                        "Задержка должна быть неотрицательной, до трёх дробных знаков.".into(),
-                    );
                 }
-            }
-            if ui
-                .add_enabled(!self.selection.is_empty(), egui::Button::new("Изменить"))
+                if self.scenario.events.is_empty() {
+                    return false;
+                }
+                let label = ui.label("Задержка, мс");
+                let delay = ui
+                    .add_enabled(
+                        !self.selection.is_empty(),
+                        egui::TextEdit::singleline(&mut self.delay).desired_width(118.0),
+                    )
+                    .labelled_by(label.id);
+                if delay.changed() {
+                    if let Some(delay) = parse_delay(&self.delay) {
+                        let event = &mut self.scenario.events[self.selected];
+                        self.changed |= event.delay_micros != delay;
+                        event.delay_micros = delay;
+                        self.error = None;
+                    } else {
+                        self.error = Some(
+                            "Задержка должна быть неотрицательной, до трёх дробных знаков.".into(),
+                        );
+                    }
+                }
+                if ui
+                    .add_enabled(!self.selection.is_empty(), egui::Button::new("Изменить"))
+                    .clicked()
+                {
+                    self.begin_edit(self.selected);
+                }
+                let delete_label = if self.path_selection.is_some() {
+                    "Удалить точки"
+                } else if self.selection.len() > 1 {
+                    "Удалить выбранные"
+                } else {
+                    "Удалить событие"
+                };
+                if ui
+                    .add_enabled(
+                        !self.selection.is_empty()
+                            || self
+                                .path_selection
+                                .as_ref()
+                                .is_some_and(|selection| !selection.points.is_empty()),
+                        egui::Button::new(delete_label),
+                    )
+                    .clicked()
+                {
+                    self.delete_selection();
+                }
+                delay.has_focus()
+            })
+            .inner;
+        if self.form.is_none()
+            && self.selected_hold().is_some()
+            && ui.button("Разделить на нажатие и отпускание").clicked()
+        {
+            self.split_selected_hold();
+        }
+        if self.form.is_none()
+            && self.selected_hold_pair().is_some()
+            && ui.button("Объединить в удержание").clicked()
+        {
+            self.merge_selected_hold();
+        }
+        if self.form.is_none()
+            && (self.selection.len() == 1 || self.path_selection.is_some())
+            && self
+                .scenario
+                .events
+                .get(self.selected)
+                .is_some_and(|timed| matches!(timed.event, Event::MousePath { .. }))
+            && ui
+                .button(if self.expanded_paths.contains(&self.selected) {
+                    "Свернуть траекторию"
+                } else {
+                    "Раскрыть траекторию"
+                })
                 .clicked()
-            {
-                self.begin_edit(self.selected);
-            }
-            let delete_label = if self.selection.len() > 1 {
-                "Удалить выбранные"
-            } else {
-                "Удалить событие"
-            };
-            if ui
-                .add_enabled(!self.selection.is_empty(), egui::Button::new(delete_label))
-                .clicked()
-            {
-                self.delete_selection();
-            }
-            delay.has_focus()
-        })
-        .inner
+        {
+            self.toggle_path(self.selected);
+        }
+        edit_has_focus
     }
 
-    fn rows(&mut self, ui: &mut egui::Ui) {
+    fn rows(&mut self, ui: &mut egui::Ui) -> bool {
         if self.scenario.events.is_empty() {
             ui.label("В сценарии нет событий");
-            return;
+            return false;
         }
         let mut selected = None;
         let mut moved = None;
         let mut editing = None;
+        let mut editing_point = false;
         let modifiers = ui.input(|input| input.modifiers);
         let mut list = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        let visible = self.visible_rows();
         if let Some(row) = self.reveal.take() {
+            let row = visible
+                .iter()
+                .position(|&(index, point)| index == row && point.is_none())
+                .unwrap_or(0);
             list = list.vertical_scroll_offset(row.saturating_sub(2) as f32 * ROW_HEIGHT);
         }
         ui.spacing_mut().item_spacing.y = 0.0;
-        list.show_rows(ui, ROW_HEIGHT, self.scenario.events.len(), |ui, rows| {
+        list.show_rows(ui, ROW_HEIGHT, visible.len(), |ui, rows| {
             let pointer = ui.input(|input| input.pointer.interact_pos());
             if let Some(pointer) = pointer {
                 let clip = ui.clip_rect();
@@ -405,7 +773,16 @@ impl Editor {
                     }
                 }
             }
-            for index in rows {
+            for row in rows {
+                let (index, point) = visible[row];
+                if let Some(point) = point {
+                    editing_point |= ui
+                        .add_enabled_ui(self.form.is_none(), |ui| {
+                            self.draw_path_point(ui, index, point)
+                        })
+                        .inner;
+                    continue;
+                }
                 let event = &self.scenario.events[index];
                 let label = format!(
                     "{}   {} · {} мс",
@@ -415,9 +792,12 @@ impl Editor {
                 );
                 let response = ui.add_sized(
                     [ui.available_width(), ROW_HEIGHT],
-                    egui::Button::selectable(self.selection.contains(&index), label)
-                        .sense(egui::Sense::click_and_drag())
-                        .truncate(),
+                    egui::Button::selectable(
+                        self.selection.contains(&index),
+                        (label, egui::Atom::grow()),
+                    )
+                    .sense(egui::Sense::click_and_drag())
+                    .truncate(),
                 );
                 if self.form.is_some() {
                     continue;
@@ -452,12 +832,14 @@ impl Editor {
             self.begin_edit(index);
         } else if let Some((from, boundary)) = moved {
             if let Some(index) = self.scenario.move_event(from, boundary) {
+                self.expanded_paths.clear();
                 self.changed = true;
                 self.select(index);
             }
         } else if let Some(index) = selected {
             self.select_with_modifiers(index, modifiers);
         }
+        editing_point
     }
 }
 
@@ -467,17 +849,21 @@ enum ActionKind {
     Move,
     MouseDown,
     MouseUp,
+    MouseHold,
     Scroll,
+    KeyHold,
     KeyDown,
     KeyUp,
 }
 
 impl ActionKind {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Move,
+        Self::MouseHold,
         Self::MouseDown,
         Self::MouseUp,
         Self::Scroll,
+        Self::KeyHold,
         Self::KeyDown,
         Self::KeyUp,
     ];
@@ -485,9 +871,11 @@ impl ActionKind {
     fn name(self) -> &'static str {
         match self {
             Self::Move => "Перемещение курсора",
+            Self::MouseHold => "Удержание кнопки мыши",
             Self::MouseDown => "Нажатие кнопки мыши",
             Self::MouseUp => "Отпускание кнопки мыши",
             Self::Scroll => "Прокрутка",
+            Self::KeyHold => "Удержание клавиши",
             Self::KeyDown => "Нажатие клавиши",
             Self::KeyUp => "Отпускание клавиши",
         }
@@ -510,6 +898,8 @@ struct PositionFields {
     key_picker_open: bool,
     delay: String,
     smooth_duration_ms: Option<u32>,
+    hold_duration_ms: String,
+    release_order: Option<u64>,
 }
 
 impl Default for PositionFields {
@@ -524,6 +914,8 @@ impl Default for PositionFields {
             key_picker_open: false,
             delay: "0".into(),
             smooth_duration_ms: None,
+            hold_duration_ms: "80".into(),
+            release_order: None,
         }
     }
 }
@@ -535,6 +927,16 @@ impl PositionFields {
             ..Self::default()
         };
         position.kind = match &timed.event {
+            Event::MouseHold {
+                button,
+                duration_micros,
+                release_order,
+            } => {
+                position.button = *button;
+                position.hold_duration_ms = format_delay(*duration_micros);
+                position.release_order = Some(*release_order);
+                ActionKind::MouseHold
+            }
             Event::MouseMove { x, y } | Event::MouseMoveSmooth { x, y, .. } => {
                 if let Event::MouseMoveSmooth { duration_ms, .. } = timed.event {
                     position.smooth_duration_ms = Some(duration_ms.get());
@@ -542,6 +944,9 @@ impl PositionFields {
                 position.x = i64::from(*x);
                 position.y = i64::from(*y);
                 ActionKind::Move
+            }
+            Event::MousePath { .. } => {
+                unreachable!("Траектория раскрывается перед редактированием")
             }
             Event::MouseDown { button } | Event::MouseUp { button } => {
                 position.button = *button;
@@ -555,6 +960,24 @@ impl PositionFields {
                 position.x = *x;
                 position.y = *y;
                 ActionKind::Scroll
+            }
+            Event::KeyHold {
+                key,
+                duration_micros,
+            }
+            | Event::KeySpan {
+                key,
+                duration_micros,
+                ..
+            } => {
+                position.release_order = if let Event::KeySpan { release_order, .. } = timed.event {
+                    Some(release_order)
+                } else {
+                    None
+                };
+                position.key.clone_from(key);
+                position.hold_duration_ms = format_delay(*duration_micros);
+                ActionKind::KeyHold
             }
             Event::KeyDown { key } | Event::KeyUp { key } => {
                 position.key.clone_from(key);
@@ -593,7 +1016,7 @@ impl PositionFields {
                     ui.label("Доли окна, от 0 до 1 000 000");
                 }
             }
-            ActionKind::MouseDown | ActionKind::MouseUp => {
+            ActionKind::MouseDown | ActionKind::MouseUp | ActionKind::MouseHold => {
                 egui::ComboBox::from_label("Кнопка мыши")
                     .selected_text(button_name(self.button))
                     .show_ui(ui, |ui| {
@@ -607,12 +1030,26 @@ impl PositionFields {
                             ui.selectable_value(&mut self.button, button, button_name(button));
                         }
                     });
+                if self.kind == ActionKind::MouseHold {
+                    let label = ui.label("Длительность, мс");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.hold_duration_ms).desired_width(105.0),
+                    )
+                    .labelled_by(label.id);
+                }
             }
-            ActionKind::KeyDown | ActionKind::KeyUp => {
+            ActionKind::KeyHold | ActionKind::KeyDown | ActionKind::KeyUp => {
                 let label = ui.label("Клавиша");
                 ui.add(egui::TextEdit::singleline(&mut self.key).desired_width(120.0))
                     .labelled_by(label.id);
                 self.key_picker(ui);
+                if self.kind == ActionKind::KeyHold {
+                    let label = ui.label("Длительность, мс");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.hold_duration_ms).desired_width(105.0),
+                    )
+                    .labelled_by(label.id);
+                }
             }
         });
         if self.kind == ActionKind::Move {
@@ -698,20 +1135,41 @@ impl PositionFields {
             ActionKind::MouseUp => Event::MouseUp {
                 button: self.button,
             },
+            ActionKind::MouseHold => Event::MouseHold {
+                button: self.button,
+                duration_micros: parse_delay(&self.hold_duration_ms)
+                    .ok_or("Проверь длительность удержания в миллисекундах.")?,
+                release_order: self.release_order.unwrap_or(0),
+            },
             ActionKind::Scroll => Event::Scroll {
                 x: self.x,
                 y: self.y,
             },
-            ActionKind::KeyDown | ActionKind::KeyUp => {
+            ActionKind::KeyHold | ActionKind::KeyDown | ActionKind::KeyUp => {
                 let name = self.key.trim();
                 let key = key_names()
                     .find(|candidate| candidate.eq_ignore_ascii_case(name))
                     .unwrap_or(name)
                     .to_owned();
-                if self.kind == ActionKind::KeyDown {
-                    Event::KeyDown { key }
-                } else {
-                    Event::KeyUp { key }
+                match self.kind {
+                    ActionKind::KeyHold => {
+                        let duration_micros = parse_delay(&self.hold_duration_ms)
+                            .ok_or("Проверь длительность удержания в миллисекундах.")?;
+                        if let Some(release_order) = self.release_order {
+                            Event::KeySpan {
+                                key,
+                                duration_micros,
+                                release_order,
+                            }
+                        } else {
+                            Event::KeyHold {
+                                key,
+                                duration_micros,
+                            }
+                        }
+                    }
+                    ActionKind::KeyDown => Event::KeyDown { key },
+                    _ => Event::KeyUp { key },
                 }
             }
         };
@@ -777,11 +1235,34 @@ fn describe(event: &Event) -> String {
         Event::MouseMoveSmooth { x, y, duration_ms } => {
             format!("Плавное перемещение до ({x}, {y}) за {duration_ms} мс")
         }
+        Event::MousePath { points } => format!(
+            "Траектория курсора · {} точек · {} мс",
+            points.len(),
+            format_delay(points.last().map_or(0, |point| point.offset_micros))
+        ),
         Event::MouseDown { button } => format!("Нажатие кнопки · {}", button_name(*button)),
         Event::MouseUp { button } => format!("Отпускание кнопки · {}", button_name(*button)),
+        Event::MouseHold {
+            button,
+            duration_micros,
+            ..
+        } => format!(
+            "Удержание кнопки {} · {} мс",
+            button_name(*button),
+            format_delay(*duration_micros)
+        ),
         Event::Scroll { x, y } => format!("Прокрутка ({x}, {y})"),
         Event::KeyDown { key } => format!("Нажатие клавиши {key}"),
         Event::KeyUp { key } => format!("Отпускание клавиши {key}"),
+        Event::KeyHold {
+            key,
+            duration_micros,
+        }
+        | Event::KeySpan {
+            key,
+            duration_micros,
+            ..
+        } => format!("Удержание {key} за {} мс", format_delay(*duration_micros)),
     }
 }
 
@@ -797,6 +1278,260 @@ fn button_name(button: MouseButton) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merging_selected_rows_creates_a_hold_for_the_pressed_key() {
+        let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
+            events: vec![
+                TimedEvent {
+                    delay_micros: 700,
+                    event: Event::KeyDown { key: "D".into() },
+                },
+                TimedEvent {
+                    delay_micros: 50125,
+                    event: Event::KeyUp { key: "F".into() },
+                },
+            ],
+        });
+        assert!(editor.selected_hold_pair().is_none());
+        editor.select_with_modifiers(1, egui::Modifiers::CTRL);
+        editor.merge_selected_hold();
+        assert_eq!(editor.scenario.events.len(), 1);
+        assert_eq!(editor.scenario.events[0].delay_micros, 700);
+        assert!(
+            matches!(&editor.scenario.events[0].event, Event::KeySpan { key, duration_micros: 50125, .. } if key == "D")
+        );
+        assert_eq!(editor.selection, [0].into());
+        assert!(editor.changed);
+        editor.split_selected_hold();
+        assert_eq!(
+            editor.scenario.events[1].event,
+            Event::KeyUp { key: "D".into() }
+        );
+    }
+
+    #[test]
+    fn mouse_hold_is_editable_and_can_be_split() {
+        let timed = TimedEvent {
+            delay_micros: 100,
+            event: Event::MouseHold {
+                button: MouseButton::Right,
+                duration_micros: 50_125,
+                release_order: 2,
+            },
+        };
+        assert_eq!(
+            PositionFields::from_event(&timed).to_timed_event().unwrap(),
+            timed
+        );
+        let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
+            events: vec![timed],
+        });
+        assert!(editor.selected_hold().is_some());
+        editor.split_selected_hold();
+        assert_eq!(
+            editor.scenario.events,
+            [
+                TimedEvent {
+                    delay_micros: 100,
+                    event: Event::MouseDown {
+                        button: MouseButton::Right
+                    }
+                },
+                TimedEvent {
+                    delay_micros: 50_125,
+                    event: Event::MouseUp {
+                        button: MouseButton::Right
+                    }
+                },
+            ]
+        );
+    }
+
+    fn path_editor() -> Editor {
+        use crate::core::scenario::MousePoint;
+        Editor::new(Scenario {
+            coordinates: CoordinateSpace::Window,
+            events: vec![TimedEvent {
+                delay_micros: 1000,
+                event: Event::MousePath {
+                    points: vec![
+                        MousePoint {
+                            offset_micros: 0,
+                            x: 10,
+                            y: 20,
+                        },
+                        MousePoint {
+                            offset_micros: 2000,
+                            x: 30,
+                            y: 40,
+                        },
+                        MousePoint {
+                            offset_micros: 5000,
+                            x: 50,
+                            y: 60,
+                        },
+                    ],
+                },
+            }],
+        })
+    }
+
+    #[test]
+    fn selecting_and_deleting_path_points_keeps_other_event_times() {
+        let mut editor = path_editor();
+        editor.scenario.events.push(TimedEvent {
+            delay_micros: 700,
+            event: Event::Scroll { x: 0, y: 1 },
+        });
+        editor.begin_edit(0);
+        editor.select_path_point(0, 0, egui::Modifiers::NONE);
+        editor.select_path_point(0, 2, egui::Modifiers::SHIFT);
+        assert_eq!(
+            editor.path_selection.as_ref().unwrap().points,
+            [0, 1, 2].into()
+        );
+        editor.select_path_point(0, 1, egui::Modifiers::CTRL);
+        assert_eq!(
+            editor.path_selection.as_ref().unwrap().points,
+            [0, 2].into()
+        );
+        assert!(editor.selection.is_empty());
+        editor.delete_selection();
+        assert_eq!(editor.scenario.events.len(), 2);
+        assert_eq!(editor.scenario.events[0].delay_micros, 3000);
+        assert_eq!(editor.scenario.events[1].delay_micros, 3700);
+        let Event::MousePath { points } = &editor.scenario.events[0].event else {
+            panic!("Ожидалась траектория")
+        };
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].offset_micros, 0);
+        assert_eq!(points[0].x, 30);
+        assert!(editor.expanded_paths.contains(&0));
+        editor.select_path_point(0, 0, egui::Modifiers::NONE);
+        editor.delete_selection();
+        assert_eq!(editor.scenario.events.len(), 1);
+        assert_eq!(editor.scenario.events[0].delay_micros, 6700);
+    }
+
+    #[test]
+    fn path_subrow_can_be_selected_and_deleted_through_the_ui() {
+        let context = egui::Context::default();
+        let mut editor = path_editor();
+        editor.begin_edit(0);
+        let output = frame(&context, &mut editor, vec![]);
+        let position = point(&output, "Точка 2", false);
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::PointerMoved(position)],
+        );
+        frame(&context, &mut editor, vec![button(position, true)]);
+        frame(&context, &mut editor, vec![button(position, false)]);
+        assert_eq!(editor.path_selection.as_ref().unwrap().points, [1].into());
+        frame(
+            &context,
+            &mut editor,
+            vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(editor.scenario.events.len(), 1);
+        let Event::MousePath { points } = &editor.scenario.events[0].event else {
+            panic!("Ожидалась траектория")
+        };
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[1].offset_micros, 5000);
+    }
+
+    #[test]
+    fn unfolding_a_path_only_changes_visible_subrows() {
+        let mut editor = path_editor();
+        let original = editor.scenario.clone();
+        editor.begin_edit(0);
+        assert_eq!(
+            editor.visible_rows(),
+            [(0, None), (0, Some(0)), (0, Some(1)), (0, Some(2))]
+        );
+        assert_eq!(editor.scenario, original);
+        assert!(!editor.changed);
+        assert!(editor.can_apply());
+        editor.toggle_path(0);
+        assert_eq!(editor.visible_rows(), [(0, None)]);
+        assert_eq!(editor.scenario, original);
+        assert!(!editor.changed);
+    }
+
+    #[test]
+    fn editing_a_subrow_preserves_the_path_and_updates_subsequent_offsets() {
+        let mut editor = path_editor();
+        editor.begin_edit(0);
+        editor.edit_path_point(0, 1, 100, 200, 4000).unwrap();
+        assert_eq!(editor.scenario.events.len(), 1);
+        let Event::MousePath { points } = &editor.scenario.events[0].event else {
+            panic!("Ожидалась траектория")
+        };
+        assert_eq!(points[1].x, 100);
+        assert_eq!(points[1].y, 200);
+        assert_eq!(
+            points
+                .iter()
+                .map(|point| point.offset_micros)
+                .collect::<Vec<_>>(),
+            [0, 4000, 7000]
+        );
+        assert!(editor.changed);
+        let edited = editor.scenario.clone();
+        assert!(editor.edit_path_point(0, 1, -1, 200, 4000).is_err());
+        assert!(editor.edit_path_point(0, 1, 100, 200, u64::MAX).is_err());
+        assert_eq!(editor.scenario, edited);
+        editor.toggle_path(0);
+        assert_eq!(editor.visible_rows(), [(0, None)]);
+        editor.toggle_path(0);
+        assert_eq!(editor.scenario, edited);
+    }
+
+    #[test]
+    fn splits_key_hold_without_losing_either_delay() {
+        let hold = TimedEvent {
+            delay_micros: 700,
+            event: Event::KeyHold {
+                key: "A".into(),
+                duration_micros: 50_125,
+            },
+        };
+        assert_eq!(
+            PositionFields::from_event(&hold).to_timed_event().unwrap(),
+            hold
+        );
+        let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
+            events: vec![hold],
+        });
+        editor.split_selected_hold();
+        assert_eq!(
+            editor.scenario.events,
+            [
+                TimedEvent {
+                    delay_micros: 700,
+                    event: Event::KeyDown { key: "A".into() }
+                },
+                TimedEvent {
+                    delay_micros: 50_125,
+                    event: Event::KeyUp { key: "A".into() }
+                },
+            ]
+        );
+        assert!(editor.changed);
+        assert_eq!(editor.selected, 0);
+        assert!(editor.selected_hold().is_none());
+    }
 
     #[test]
     fn smooth_move_is_a_single_editable_action() {
