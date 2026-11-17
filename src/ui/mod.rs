@@ -167,6 +167,13 @@ impl Default for PlaybackSettings {
 }
 
 impl PlaybackSettings {
+    fn remaining_seconds(&self, duration: Duration, pass: u64, elapsed: Duration) -> u64 {
+        let pass_seconds = duration.as_secs_f64() / self.speed;
+        let current_remaining = (pass_seconds - elapsed.as_secs_f64()).max(0.0);
+        let future_passes = u64::from(self.count).saturating_sub(pass);
+        (current_remaining + pass_seconds * future_passes as f64).ceil() as u64
+    }
+
     fn options(&self) -> PlaybackOptions {
         PlaybackOptions {
             speed: self.speed,
@@ -1147,7 +1154,24 @@ impl MainWindow {
             Status::Playing(pass) if self.playback.infinite => {
                 format!("Запуск {} · без лимита", pass.number)
             }
-            Status::Playing(pass) => format!("Запуск {} из {}", pass.number, self.playback.count),
+            Status::Playing(pass) => {
+                let label = format!("Запуск {} из {}", pass.number, self.playback.count);
+                let Some(loaded) = &self.loaded else {
+                    return label;
+                };
+                let remaining = self.playback.remaining_seconds(
+                    loaded.duration,
+                    pass.number,
+                    pass.started_at.elapsed(),
+                );
+                let clock = format!("{:02}:{:02}", remaining / 60 % 60, remaining % 60);
+                let hours = remaining / 3600;
+                if hours > 0 {
+                    format!("{label} · осталось ≈ {hours}:{clock}")
+                } else {
+                    format!("{label} · осталось ≈ {clock}")
+                }
+            }
             Status::Recording => "Идёт запись".into(),
             Status::RecordingReady => "Запись завершена".into(),
             Status::RecordingCancelled => "Запись отменена до запуска".into(),
@@ -1331,6 +1355,32 @@ fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remaining_time_accounts_for_speed_current_run_and_future_runs() {
+        let settings = PlaybackSettings {
+            speed: 2.0,
+            count: 5,
+            infinite: false,
+        };
+        let duration = Duration::from_secs(50);
+        assert_eq!(
+            settings.remaining_seconds(duration, 2, Duration::from_secs(16)),
+            84
+        );
+        assert_eq!(
+            settings.remaining_seconds(duration, 2, Duration::from_secs(26)),
+            75
+        );
+        assert_eq!(
+            settings.remaining_seconds(duration, 5, Duration::from_millis(24_900)),
+            1
+        );
+        assert_eq!(
+            settings.remaining_seconds(Duration::ZERO, 1, Duration::ZERO),
+            0
+        );
+    }
 
     #[test]
     fn recent_list_displays_ten_rows_and_opens_only_on_double_click() {
