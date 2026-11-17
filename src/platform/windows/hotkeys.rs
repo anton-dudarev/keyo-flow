@@ -3,6 +3,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn defaults_match_requested_shortcuts_and_explicitly_cleared_values_stay_empty() {
+        let settings = HotkeySettings::default();
+        let targets = settings.targets().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].1.code, u32::from(b'R'));
+        assert_eq!(targets[1].1.code, u32::from(b'P'));
+        for (_, chord) in targets {
+            assert_eq!(chord.modifiers, MOD_ALT | MOD_SHIFT | MOD_WIN);
+        }
+        let cleared: HotkeySettings =
+            serde_json::from_str(r#"{"record":{"key":""},"play":{"key":""}}"#).unwrap();
+        assert!(cleared.targets().unwrap().is_empty());
+    }
+
+    #[test]
     fn validates_win_combinations_and_rejects_duplicates() {
         let record = Shortcut {
             win: true,
@@ -48,12 +63,29 @@ pub(crate) struct Shortcut {
     pub(crate) key: String,
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct HotkeySettings {
     pub(crate) record: Shortcut,
     pub(crate) play: Shortcut,
     pub(crate) show_playback_indicator: bool,
+}
+
+impl Default for HotkeySettings {
+    fn default() -> Self {
+        let shortcut = |key: &str| Shortcut {
+            alt: true,
+            shift: true,
+            win: true,
+            key: key.into(),
+            ..Default::default()
+        };
+        Self {
+            record: shortcut("R"),
+            play: shortcut("P"),
+            show_playback_indicator: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

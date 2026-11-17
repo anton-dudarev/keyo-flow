@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, FontData, FontDefinitions, FontFamily, RichText, Theme};
 use windows_sys::Win32::UI::Controls::Dialogs::{
-    CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST,
-    OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    CommDlgExtendedError, GetSaveFileNameW, OFN_EXPLORER, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -32,6 +32,7 @@ use crate::platform::windows::{
 use crate::storage::{read_json, write_json_new, write_json_replace};
 
 mod editor;
+mod open_dialog;
 mod overlay;
 mod placement;
 mod recent;
@@ -346,8 +347,12 @@ impl MainWindow {
     fn open(&mut self, context: &egui::Context) {
         // SAFETY: получаем HWND активного окна в потоке интерфейса.
         let owner = unsafe { GetActiveWindow() } as isize;
+        let last_directory = self.recent.last_open_directory.clone();
         self.start_job(context, None, false, Status::Opening, move |send| {
-            send(Message::Opened(load_selected(owner)));
+            send(Message::Opened(load_selected(
+                owner,
+                last_directory.as_deref(),
+            )));
         });
     }
 
@@ -357,10 +362,13 @@ impl MainWindow {
         });
     }
 
-    fn set_loaded(&mut self, loaded: Loaded) {
-        self.recent_error = self
-            .recent
-            .remember(&loaded.path)
+    fn set_loaded(&mut self, loaded: Loaded, opened: bool) {
+        let remembered = if opened {
+            self.recent.remember_opened(&loaded.path)
+        } else {
+            self.recent.remember(&loaded.path)
+        };
+        self.recent_error = remembered
             .err()
             .map(|error| format!("Не удалось сохранить список недавних. {error}"));
         self.loaded = Some(loaded);
@@ -504,7 +512,7 @@ impl MainWindow {
 
     fn save_copy(&mut self, context: &egui::Context, owner: isize, scenario: Arc<Scenario>) {
         self.start_job(context, None, false, Status::Saving, move |send| {
-            let result = select_json(owner, true).and_then(|path| {
+            let result = select_save_json(owner).and_then(|path| {
                 let Some(path) = path else { return Ok(None) };
                 validate_playback(&scenario)?;
                 let saved = save_to_path(&path, &scenario, |path| confirm_replace(owner, path))?;
@@ -580,7 +588,7 @@ impl MainWindow {
                     self.status = match result {
                         Ok(loaded) => {
                             if let Some(loaded) = loaded {
-                                self.set_loaded(loaded);
+                                self.set_loaded(loaded, true);
                             }
                             Status::Ready
                         }
@@ -630,7 +638,7 @@ impl MainWindow {
                             self.pending_recording = None;
                             self.original = None;
                             self.editor = None;
-                            self.set_loaded(loaded);
+                            self.set_loaded(loaded, false);
                             Status::Saved
                         }
                         Ok(None) => {
@@ -1364,8 +1372,11 @@ fn configure_style(context: &egui::Context) {
     }
 }
 
-fn load_selected(owner: isize) -> io::Result<Option<Loaded>> {
-    let Some(path) = select_json(owner, false)? else {
+fn load_selected(owner: isize, last_directory: Option<&Path>) -> io::Result<Option<Loaded>> {
+    let executable = std::env::current_exe()?;
+    let directory = RecentScenarios::initial_directory(last_directory, &executable);
+    let Some(path) = open_dialog::select(owner, directory.as_deref()).map_err(io::Error::other)?
+    else {
         return Ok(None);
     };
     load_path(path).map(Some)
@@ -1415,18 +1426,12 @@ fn confirm_replace(owner: isize, path: &Path) -> bool {
     }
 }
 
-fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
+fn select_save_json(owner: isize) -> io::Result<Option<PathBuf>> {
     let mut path = vec![0u16; 32_768];
     let filter: Vec<u16> = "Сценарии JSON (*.json)\0*.json\0\0"
         .encode_utf16()
         .collect();
-    let title: Vec<u16> = if save {
-        "Сохранить сценарий Keyo\0"
-    } else {
-        "Открыть сценарий Keyo\0"
-    }
-    .encode_utf16()
-    .collect();
+    let title: Vec<u16> = "Сохранить сценарий Keyo\0".encode_utf16().collect();
     let extension: Vec<u16> = "json\0".encode_utf16().collect();
     let mut dialog = OPENFILENAMEW {
         lStructSize: size_of::<OPENFILENAMEW>() as u32,
@@ -1436,20 +1441,11 @@ fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
         nMaxFile: path.len() as u32,
         lpstrTitle: title.as_ptr(),
         lpstrDefExt: extension.as_ptr(),
-        Flags: OFN_EXPLORER
-            | OFN_PATHMUSTEXIST
-            | OFN_NOCHANGEDIR
-            | if save { 0 } else { OFN_FILEMUSTEXIST },
+        Flags: OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
         ..Default::default()
     };
     // SAFETY: все указатели диалога остаются действительными до завершения вызова.
-    let selected = unsafe {
-        if save {
-            GetSaveFileNameW(&mut dialog)
-        } else {
-            GetOpenFileNameW(&mut dialog)
-        }
-    };
+    let selected = unsafe { GetSaveFileNameW(&mut dialog) };
     if selected == 0 {
         // SAFETY: запрашиваем ошибку только что закрытого диалога в том же потоке.
         let error = unsafe { CommDlgExtendedError() };
