@@ -147,36 +147,70 @@ pub(crate) struct OpenWindow {
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn open_windows() -> Vec<OpenWindow> {
-    use windows_sys::core::BOOL;
-    use windows_sys::Win32::Foundation::LPARAM;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextW, IsWindowVisible,
-    };
+impl OpenWindow {
+    fn from_handle(window: HWND) -> Option<Self> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextW, IsWindowVisible};
 
-    unsafe extern "system" fn collect(window: HWND, data: LPARAM) -> BOOL {
         let mut process = 0;
-        // SAFETY: EnumWindows передаёт HWND, а буфер идентификатора жив до конца вызова.
+        // SAFETY: Win32 проверяет дескриптор и записывает идентификатор в локальную переменную.
         let thread = unsafe { GetWindowThreadProcessId(window, &mut process) };
-        // SAFETY: IsWindowVisible принимает HWND без разыменования указателя в Rust.
+        // SAFETY: проверка видимости принимает HWND без разыменования указателя в Rust.
         if thread == 0 || process == std::process::id() || unsafe { IsWindowVisible(window) } == 0 {
-            return 1;
+            return None;
         }
         let mut title = [0; 512];
         // SAFETY: передаём доступный для записи буфер с его фактической длиной.
         let len = unsafe { GetWindowTextW(window, title.as_mut_ptr(), title.len() as i32) };
-        let title = String::from_utf16_lossy(&title[..len.max(0) as usize]);
-        if !title.trim().is_empty() {
+        Some(Self {
+            target: PlaybackTarget {
+                window: window as isize,
+                process,
+                thread,
+            },
+            title: String::from_utf16_lossy(&title[..len.max(0) as usize]),
+        })
+    }
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn pick_window(
+    cancelled: &std::sync::atomic::AtomicBool,
+    report: impl FnMut(u8),
+) -> io::Result<Option<OpenWindow>> {
+    use std::sync::atomic::Ordering;
+
+    let _active = super::ACTIVE
+        .try_lock()
+        .map_err(|_| io::Error::other("Адаптер Windows уже занят или завершился с ошибкой"))?;
+    let _stop = super::StopHook::install(true)?;
+    let stop = || cancelled.load(Ordering::Relaxed) || super::stop_requested();
+    if !super::countdown_with(stop, super::wait_for_messages, report) || stop() {
+        return Ok(None);
+    }
+    // SAFETY: получение активного окна не требует входных данных.
+    let mut selected =
+        OpenWindow::from_handle(unsafe { GetForegroundWindow() }).ok_or_else(|| {
+            io::Error::other("Переключись на окно другого приложения до конца отсчёта")
+        })?;
+    if selected.title.trim().is_empty() {
+        selected.title = "Окно без заголовка".into();
+    }
+    Ok(Some(selected))
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn open_windows() -> Vec<OpenWindow> {
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::LPARAM;
+    use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    unsafe extern "system" fn collect(window: HWND, data: LPARAM) -> BOOL {
+        if let Some(window) =
+            OpenWindow::from_handle(window).filter(|window| !window.title.trim().is_empty())
+        {
             // SAFETY: EnumWindows синхронно передаёт указатель на локальный список из open_windows.
             let windows = unsafe { &mut *(data as *mut Vec<OpenWindow>) };
-            windows.push(OpenWindow {
-                target: PlaybackTarget {
-                    window: window as isize,
-                    process,
-                    thread,
-                },
-                title,
-            });
+            windows.push(window);
         }
         1
     }

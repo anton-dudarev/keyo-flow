@@ -25,7 +25,7 @@ use crate::core::scenario::{CoordinateSpace, Scenario};
 use crate::platform::windows::hotkeys::{
     Action as HotkeyAction, HotkeyEvent, HotkeyService, HotkeySettings,
 };
-use crate::platform::windows::target::{open_windows, OpenWindow};
+use crate::platform::windows::target::{open_windows, pick_window, OpenWindow};
 use crate::platform::windows::{
     play_with_target, record_with_target, validate_playback, PlaybackUpdate, RecordingUpdate,
 };
@@ -124,6 +124,9 @@ enum Status {
     Opening,
     Preparing,
     Countdown(u8),
+    SelectingWindow(u8),
+    WindowSelected,
+    WindowSelectionCancelled,
     Playing(PlaybackPass),
     Recording,
     RecordingReady,
@@ -138,6 +141,7 @@ enum Status {
 
 enum Message {
     Opened(io::Result<Option<Loaded>>),
+    TargetSelected(io::Result<Option<OpenWindow>>),
     Progress(Status),
     Finished(io::Result<PlaybackOutcome>),
     Recorded(io::Result<Option<Scenario>>),
@@ -359,6 +363,23 @@ impl MainWindow {
         self.loaded = Some(loaded);
     }
 
+    fn select_window(&mut self, context: &egui::Context) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        self.start_job(
+            context,
+            Some(stop),
+            false,
+            Status::SelectingWindow(3),
+            move |send| {
+                let result = pick_window(&worker_stop, |seconds| {
+                    send(Message::Progress(Status::SelectingWindow(seconds)));
+                });
+                send(Message::TargetSelected(result));
+            },
+        );
+    }
+
     fn play(&mut self, context: &egui::Context) {
         let Some(loaded) = &self.loaded else { return };
         let scenario = Arc::clone(&loaded.scenario);
@@ -569,6 +590,20 @@ impl MainWindow {
                     self.status = match result {
                         Ok(outcome) => Status::Finished(outcome),
                         Err(error) => Status::Error(format!("Воспроизведение прервано. {error}")),
+                    };
+                }
+                Ok(Message::TargetSelected(result)) => {
+                    self.job = None;
+                    self.status = match result {
+                        _ if matches!(self.status, Status::Stopping) => {
+                            Status::WindowSelectionCancelled
+                        }
+                        Ok(Some(window)) => {
+                            self.playback_target = Some(window);
+                            Status::WindowSelected
+                        }
+                        Ok(None) => Status::WindowSelectionCancelled,
+                        Err(error) => Status::Error(format!("Не удалось выбрать окно. {error}")),
                     };
                 }
                 Ok(Message::Recorded(result)) => {
@@ -931,7 +966,9 @@ impl MainWindow {
                 }
             }
             if active {
-                let hint = if self.recording_active() {
+                let hint = if matches!(self.status, Status::SelectingWindow(_)) {
+                    "Отмена выбора: Esc"
+                } else if self.recording_active() {
                     if self.hotkey_settings.recording_shortcut().is_some() {
                         "Для остановки повтори сочетание записи или нажми «Стоп»"
                     } else {
@@ -964,6 +1001,8 @@ impl MainWindow {
     }
 
     fn draw_playback_target(&mut self, ui: &mut egui::Ui) {
+        let mut pick = false;
+        let mut changed = false;
         ui.horizontal(|ui| {
             let label = ui.label("Тестовое окно");
             let selected = self.playback_target.as_ref();
@@ -975,11 +1014,16 @@ impl MainWindow {
                 .truncate()
                 .show_ui(ui, |ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    if ui.button("Выбрать переключением").clicked() {
+                        pick = true;
+                        ui.close();
+                    }
                     if ui
                         .selectable_label(self.playback_target.is_none(), "Любое активное окно")
                         .clicked()
                     {
                         self.playback_target = None;
+                        changed = true;
                         ui.close();
                     }
                     for window in open_windows() {
@@ -993,6 +1037,7 @@ impl MainWindow {
                             .clicked()
                         {
                             self.playback_target = Some(window);
+                            changed = true;
                             ui.close();
                         }
                     }
@@ -1000,6 +1045,16 @@ impl MainWindow {
                 .response
                 .labelled_by(label.id);
         });
+        if pick {
+            self.select_window(ui.ctx());
+        } else if changed
+            && matches!(
+                self.status,
+                Status::WindowSelected | Status::WindowSelectionCancelled
+            )
+        {
+            self.status = Status::Ready;
+        }
     }
 
     fn draw_recent(&mut self, ui: &mut egui::Ui) {
@@ -1151,6 +1206,11 @@ impl MainWindow {
                 format!("Запись через {seconds} с")
             }
             Status::Countdown(seconds) => format!("Запуск через {seconds} с"),
+            Status::SelectingWindow(seconds) => {
+                format!("Переключись в тестовое окно. Выбор через {seconds} с")
+            }
+            Status::WindowSelected => "Тестовое окно выбрано".into(),
+            Status::WindowSelectionCancelled => "Выбор тестового окна отменён".into(),
             Status::Playing(pass) if self.playback.infinite => {
                 format!("Запуск {} · без лимита", pass.number)
             }
@@ -1188,7 +1248,9 @@ impl MainWindow {
 
     fn progress(&self, context: &egui::Context) -> Option<f32> {
         match self.status {
-            Status::Countdown(seconds) => Some(f32::from(3 - seconds) / 3.0),
+            Status::Countdown(seconds) | Status::SelectingWindow(seconds) => {
+                Some(f32::from(3 - seconds) / 3.0)
+            }
             Status::Playing(pass) => {
                 let duration = self.loaded.as_ref()?.duration;
                 if duration.is_zero() {
@@ -1355,6 +1417,32 @@ fn select_json(owner: isize, save: bool) -> io::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelling_window_selection_clears_the_job_and_ignores_late_results() {
+        let (sender, messages) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut window = MainWindow {
+            job: Some(Job {
+                messages,
+                stop: Some(Arc::clone(&stop)),
+                recording: false,
+            }),
+            status: Status::SelectingWindow(1),
+            ..Default::default()
+        };
+        window.stop();
+        assert!(stop.load(Ordering::Relaxed));
+        sender
+            .send(Message::TargetSelected(Err(io::Error::other(
+                "Запоздалый результат",
+            ))))
+            .unwrap();
+        window.poll_messages();
+        assert!(window.job.is_none());
+        assert!(window.playback_target.is_none());
+        assert!(matches!(window.status, Status::WindowSelectionCancelled));
+    }
 
     #[test]
     fn remaining_time_accounts_for_speed_current_run_and_future_runs() {
