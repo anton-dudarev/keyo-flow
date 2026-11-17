@@ -48,13 +48,17 @@ pub fn run() -> eframe::Result {
     let windows = WindowSettings::load();
     let hotkey_file = profile_file("hotkeys.json");
     let hotkey_settings = settings::load(hotkey_file.as_deref());
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(WINDOW_SIZE)
             .with_resizable(false)
             .with_maximize_button(false),
         ..Default::default()
     };
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+    }
     eframe::run_native(
         "Keyo",
         options,
@@ -756,7 +760,7 @@ impl eframe::App for MainWindow {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         let _ = self.windows.save();
     }
 }
