@@ -1,13 +1,40 @@
 {
-  "version": 2,
+  "version": 3,
   "events": [
     {
-      "delay_micros": 5000000,
-      "event": { "type": "key_down", "key": "A" }
+      "delay_micros": 300000,
+      "event": { "type": "mouse_move", "x": 260000, "y": 350000 }
     },
     {
-      "delay_micros": 50000,
-      "event": { "type": "key_up", "key": "A" }
+      "delay_micros": 650000,
+      "event": { "type": "mouse_move_smooth", "x": 520000, "y": 470000, "duration_ms": 650 }
+    },
+    {
+      "delay_micros": 450000,
+      "event": {
+        "type": "mouse_path",
+        "points": [
+          { "offset_micros": 0, "x": 520000, "y": 470000 },
+          { "offset_micros": 180000, "x": 570000, "y": 520000 },
+          { "offset_micros": 360000, "x": 520000, "y": 570000 },
+          { "offset_micros": 540000, "x": 470000, "y": 520000 },
+          { "offset_micros": 720000, "x": 520000, "y": 470000 }
+        ]
+      }
+    },
+    {
+      "delay_micros": 400000,
+      "event": { "type": "mouse_hold", "button": "left", "duration_micros": 60000, "release_order": 0 }
+    },
+    {
+      "delay_micros": 550000,
+      "event": {
+        "type": "key_span",
+        "key": "F",
+        "scan_code": { "code": 33, "extended": false },
+        "duration_micros": 80000,
+        "release_order": 0
+      }
     }
   ]
 }

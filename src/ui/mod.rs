@@ -1731,8 +1731,10 @@ mod tests {
     fn applying_edits_changes_playback_data_without_mutating_the_original() {
         let original =
             Arc::new(read_json(include_bytes!("../../scenario.json").as_slice()).unwrap());
+        let original_delay = original.events[0].delay_micros;
+        let original_duration = Loaded::duration_of(&original);
         let mut editor = Editor::new((*original).clone());
-        editor.scenario.events[0].delay_micros = 1_000_000;
+        editor.scenario.events[0].delay_micros += 1_000_000;
         editor.changed = true;
         let mut window = MainWindow {
             loaded: Some(Loaded::new("scenario.json".into(), Arc::clone(&original))),
@@ -1743,13 +1745,13 @@ mod tests {
         assert!(matches!(window.status, Status::Unsaved));
         assert_eq!(
             window.loaded.as_ref().unwrap().duration,
-            Duration::from_millis(1050)
+            original_duration + Duration::from_secs(1)
         );
         assert!(Arc::ptr_eq(
             &window.original.as_ref().unwrap().scenario,
             &original
         ));
-        assert_eq!(original.events[0].delay_micros, 5_000_000);
+        assert_eq!(original.events[0].delay_micros, original_delay);
     }
 
     #[test]
@@ -1759,7 +1761,7 @@ mod tests {
         configure_style(&context);
         let sample = read_json(include_bytes!("../../scenario.json").as_slice()).unwrap();
         let mut editor = Editor::new(Scenario {
-            coordinates: Default::default(),
+            coordinates: sample.coordinates,
             events: (0..50)
                 .flat_map(|_| sample.events.iter().cloned())
                 .collect(),
@@ -1843,6 +1845,7 @@ mod tests {
     fn recording_survives_cancelled_save_and_becomes_ready_after_retry() {
         let scenario =
             Arc::new(read_json(include_bytes!("../../scenario.json").as_slice()).unwrap());
+        let duration = Loaded::duration_of(&scenario);
         let mut window = MainWindow {
             pending_recording: Some(Arc::clone(&scenario)),
             ..Default::default()
@@ -1876,7 +1879,7 @@ mod tests {
         assert!(matches!(window.status, Status::Saved));
         let loaded = window.loaded.as_ref().unwrap();
         assert_eq!(loaded.name, "recorded.json");
-        assert_eq!(loaded.duration, Duration::from_millis(5050));
+        assert_eq!(loaded.duration, duration);
     }
 
     #[test]
@@ -1894,12 +1897,7 @@ mod tests {
             let scenario = read_json(include_bytes!("../../scenario.json").as_slice()).unwrap();
             let (_sender, messages) = mpsc::channel();
             let mut window = MainWindow {
-                loaded: Some(Loaded {
-                    name: "scenario.json".into(),
-                    path: "scenario.json".into(),
-                    duration: Duration::from_millis(5_050),
-                    scenario: Arc::new(scenario),
-                }),
+                loaded: Some(Loaded::new("scenario.json".into(), Arc::new(scenario))),
                 job: running.then(|| Job {
                     messages,
                     stop: Some(Arc::new(AtomicBool::new(false))),
@@ -2102,20 +2100,20 @@ mod tests {
             status: Status::Opening,
             ..Default::default()
         };
-        let scenario = read_json(include_bytes!("../../scenario.json").as_slice()).unwrap();
+        let scenario =
+            Arc::new(read_json(include_bytes!("../../scenario.json").as_slice()).unwrap());
         sender
-            .send(Message::Opened(Ok(Some(Loaded {
-                name: "scenario.json".into(),
-                path: "scenario.json".into(),
-                duration: Duration::from_millis(5_050),
-                scenario: Arc::new(scenario),
-            }))))
+            .send(Message::Opened(Ok(Some(Loaded::new(
+                "scenario.json".into(),
+                Arc::clone(&scenario),
+            )))))
             .unwrap();
         window.poll_messages();
         assert!(window.job.is_none());
         assert!(matches!(window.status, Status::Ready));
         let loaded = window.loaded.as_ref().unwrap();
         assert_eq!(loaded.name, "scenario.json");
-        assert_eq!(loaded.scenario.events.len(), 2);
+        assert_eq!(loaded.scenario.coordinates, CoordinateSpace::Window);
+        assert_eq!(loaded.scenario, scenario);
     }
 }
