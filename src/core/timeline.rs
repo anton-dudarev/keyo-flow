@@ -224,98 +224,157 @@ impl Scenario {
         let mut releases = Vec::new();
         for (index, timed) in self.events.iter().enumerate() {
             at += u128::from(timed.delay_micros);
+            let duration = u128::from(timed.event.duration_micros());
             let crosses_release = release.is_some_and(|release| {
-                at < release && release < at + u128::from(timed.event.duration_micros())
+                (at..=at + duration).contains(&release)
+                    && matches!(
+                        timed.event,
+                        Event::KeyHold { .. }
+                            | Event::MouseMoveSmooth { .. }
+                            | Event::MousePath { .. }
+                    )
             });
-            if selected.is_none_or(|selected| selected == index) || crosses_release {
-                match &timed.event {
-                    Event::MouseHold {
-                        button,
-                        duration_micros,
-                        release_order,
-                    } => {
-                        rows.push((at, Event::MouseDown { button: *button }));
+            let expand = selected.is_none_or(|selected| selected == index) || crosses_release;
+            let mut push = |time, event| rows.push((time, index, event));
+            match &timed.event {
+                Event::MouseHold {
+                    button,
+                    duration_micros,
+                    release_order,
+                } => {
+                    let end = at + u128::from(*duration_micros);
+                    if expand || release == Some(end) {
                         releases.push((
-                            at + u128::from(*duration_micros),
+                            end,
                             *release_order,
-                            Event::MouseUp { button: *button },
+                            index,
+                            at == end,
+                            expand.then_some(Event::MouseUp { button: *button }),
                         ));
                     }
-                    Event::KeySpan {
-                        key,
-                        duration_micros,
-                        release_order,
-                    } => {
-                        rows.push((at, Event::KeyDown { key: key.clone() }));
-                        releases.push((
-                            at + u128::from(*duration_micros),
-                            *release_order,
-                            Event::KeyUp { key: key.clone() },
-                        ));
-                    }
-                    Event::KeyHold {
-                        key,
-                        duration_micros,
-                    } => {
-                        rows.push((at, Event::KeyDown { key: key.clone() }));
-                        rows.push((
-                            at + u128::from(*duration_micros),
-                            Event::KeyUp { key: key.clone() },
-                        ));
-                    }
-                    Event::MouseMoveSmooth { x, y, .. } => {
-                        let from = position.ok_or_else(|| {
-                            io::Error::other("Для плавного движения нужна начальная точка")
-                        })?;
-                        for (offset, event) in
-                            smooth_steps(from, (*x, *y), timed.event.duration_micros())
-                        {
-                            rows.push((at + u128::from(offset), event));
-                        }
-                    }
-                    Event::MousePath { points } => {
-                        for point in points {
-                            rows.push((
-                                at + u128::from(point.offset_micros),
-                                Event::MouseMove {
-                                    x: point.x,
-                                    y: point.y,
-                                },
-                            ));
-                        }
-                    }
-                    event => rows.push((at, event.clone())),
+                    push(
+                        at,
+                        if expand {
+                            Event::MouseDown { button: *button }
+                        } else {
+                            timed.event.clone()
+                        },
+                    );
                 }
-            } else {
-                rows.push((at, timed.event.clone()));
+                Event::KeySpan {
+                    key,
+                    duration_micros,
+                    release_order,
+                } => {
+                    let end = at + u128::from(*duration_micros);
+                    if expand || release == Some(end) {
+                        releases.push((
+                            end,
+                            *release_order,
+                            index,
+                            at == end,
+                            expand.then(|| Event::KeyUp { key: key.clone() }),
+                        ));
+                    }
+                    push(
+                        at,
+                        if expand {
+                            Event::KeyDown { key: key.clone() }
+                        } else {
+                            timed.event.clone()
+                        },
+                    );
+                }
+                Event::KeyHold {
+                    key,
+                    duration_micros,
+                } if expand => {
+                    push(at, Event::KeyDown { key: key.clone() });
+                    push(
+                        at + u128::from(*duration_micros),
+                        Event::KeyUp { key: key.clone() },
+                    );
+                }
+                Event::MouseMoveSmooth { x, y, .. } if expand => {
+                    let from = position.ok_or_else(|| {
+                        io::Error::other("Для плавного движения нужна начальная точка")
+                    })?;
+                    for (offset, event) in
+                        smooth_steps(from, (*x, *y), timed.event.duration_micros())
+                    {
+                        push(at + u128::from(offset), event);
+                    }
+                }
+                Event::MousePath { points } if expand => {
+                    for point in points {
+                        push(
+                            at + u128::from(point.offset_micros),
+                            Event::MouseMove {
+                                x: point.x,
+                                y: point.y,
+                            },
+                        );
+                    }
+                }
+                event => push(at, event.clone()),
             }
             position = timed.event.pointer_position().or(position);
-            at += u128::from(timed.event.duration_micros());
+            at += duration;
         }
-        rows.sort_by_key(|(at, _)| *at);
-        releases.sort_by_key(|(at, order, _)| (*at, *order));
+        rows.sort_by_key(|row| row.0);
+        releases.sort_by_key(|release| (release.0, release.1));
         let mut rows = rows.into_iter().peekable();
         let mut releases = releases.into_iter().peekable();
         let mut merged = Vec::new();
+        let mut retained_orders = HashMap::new();
         while rows.peek().is_some() || releases.peek().is_some() {
-            let at = rows
-                .peek()
-                .map(|(at, _)| *at)
-                .unwrap_or(u128::MAX)
-                .min(releases.peek().map(|(at, _, _)| *at).unwrap_or(u128::MAX));
+            let at = rows.peek().map(|row| row.0).unwrap_or(u128::MAX).min(
+                releases
+                    .peek()
+                    .map(|release| release.0)
+                    .unwrap_or(u128::MAX),
+            );
             let mut group = Vec::new();
-            while rows.peek().is_some_and(|(time, _)| *time == at) {
-                group.push(rows.next().unwrap().1);
+            while rows.peek().is_some_and(|row| row.0 == at) {
+                let (_, source, event) = rows.next().unwrap();
+                group.push((source, Some(event)));
             }
-            while releases.peek().is_some_and(|(time, _, _)| *time == at) {
-                let (_, order, event) = releases.next().unwrap();
+            while releases.peek().is_some_and(|release| release.0 == at) {
+                let (_, order, source, zero_duration, event) = releases.next().unwrap();
+                // Отпускание в той же микросекунде следует за своим нажатием.
+                let after_down = if zero_duration {
+                    group.iter().position(|row| row.0 == source).unwrap() + 1
+                } else {
+                    0
+                };
                 let index = usize::try_from(order)
                     .unwrap_or(usize::MAX)
+                    .max(after_down)
                     .min(group.len());
-                group.insert(index, event);
+                group.insert(index, (source, event));
             }
-            merged.extend(group.into_iter().map(|event| (at, event)));
+            for (order, (source, event)) in group.into_iter().enumerate() {
+                if let Some(event) = event {
+                    merged.push((at, source, event));
+                } else {
+                    // Скрытое отпускание занимает своё место даже при раскрытии одной строки.
+                    retained_orders.insert(source, order as u64);
+                }
+            }
         }
+        let merged = merged
+            .into_iter()
+            .map(|(at, source, mut event)| {
+                if let (
+                    Some(order),
+                    Event::MouseHold { release_order, .. } | Event::KeySpan { release_order, .. },
+                ) = (retained_orders.get(&source), &mut event)
+                {
+                    *release_order = *order;
+                }
+                (at, event)
+            })
+            .collect();
         Ok(Self {
             coordinates: self.coordinates,
             events: ordered(merged)?,
@@ -499,6 +558,112 @@ mod tests {
         assert_eq!(compacted.expand_recorded().unwrap(), original);
         let split = compacted.expand_row(Some(0)).unwrap();
         assert_eq!(split.expand_recorded().unwrap(), original);
+    }
+
+    #[test]
+    fn zero_duration_holds_release_before_the_next_action() {
+        let scenario = crate::storage::read_json(
+            br#"{"version":2,"events":[
+                {"delay_micros":10,"event":{"type":"mouse_hold","button":"left","duration_micros":0}},
+                {"delay_micros":0,"event":{"type":"key_span","key":"A","duration_micros":0}},
+                {"delay_micros":0,"event":{"type":"mouse_move","x":1,"y":2}}
+            ]}"#
+            .as_slice(),
+        )
+        .unwrap();
+        use crate::core::scenario::MouseButton::Left;
+        let expected = ordered(vec![
+            (10, Event::MouseDown { button: Left }),
+            (10, Event::MouseUp { button: Left }),
+            (10, Event::KeyDown { key: "A".into() }),
+            (10, Event::KeyUp { key: "A".into() }),
+            (10, Event::MouseMove { x: 1, y: 2 }),
+        ])
+        .unwrap();
+        assert_eq!(scenario.expand_recorded().unwrap().events, expected);
+        for index in 0..2 {
+            assert_eq!(
+                scenario
+                    .expand_row(Some(index))
+                    .unwrap()
+                    .expand_recorded()
+                    .unwrap()
+                    .events,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn splitting_either_hold_preserves_simultaneous_releases_before_a_click() {
+        use crate::core::scenario::MouseButton::Left;
+        let original = Scenario {
+            coordinates: Default::default(),
+            events: ordered(vec![
+                (
+                    10,
+                    Event::KeyDown {
+                        key: "ControlLeft".into(),
+                    },
+                ),
+                (
+                    20,
+                    Event::KeyDown {
+                        key: "ShiftLeft".into(),
+                    },
+                ),
+                (
+                    30,
+                    Event::KeyUp {
+                        key: "ControlLeft".into(),
+                    },
+                ),
+                (
+                    30,
+                    Event::KeyUp {
+                        key: "ShiftLeft".into(),
+                    },
+                ),
+                (30, Event::MouseDown { button: Left }),
+                (40, Event::MouseUp { button: Left }),
+            ])
+            .unwrap(),
+        };
+        let mut compacted = original.clone();
+        compact(&mut compacted);
+        for index in 0..2 {
+            let split = compacted.expand_row(Some(index)).unwrap();
+            assert!(split
+                .events
+                .iter()
+                .any(|timed| matches!(timed.event, Event::KeySpan { .. })));
+            assert_eq!(split.expand_recorded().unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn splitting_preserves_release_after_a_path_with_simultaneous_points() {
+        let original = Scenario {
+            coordinates: Default::default(),
+            events: ordered(vec![
+                (0, Event::KeyDown { key: "A".into() }),
+                (10, Event::MouseMove { x: 1, y: 2 }),
+                (10, Event::MouseMove { x: 3, y: 4 }),
+                (10, Event::KeyUp { key: "A".into() }),
+                (10, Event::KeyDown { key: "B".into() }),
+            ])
+            .unwrap(),
+        };
+        let mut compacted = original.clone();
+        compact(&mut compacted);
+        assert_eq!(
+            compacted
+                .expand_row(Some(0))
+                .unwrap()
+                .expand_recorded()
+                .unwrap(),
+            original
+        );
     }
 
     #[test]

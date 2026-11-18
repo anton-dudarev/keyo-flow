@@ -26,9 +26,9 @@ mod corner;
 #[cfg(feature = "gui")]
 pub(crate) mod hotkeys;
 pub(crate) mod target;
-#[cfg(feature = "gui")]
-pub(crate) use capture::record_with_target;
 pub use capture::{record, record_with_updates, RecordingUpdate};
+#[cfg(feature = "gui")]
+pub(crate) use capture::{record_with_target, RecordingStopClick};
 
 static STOPPED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: Mutex<()> = Mutex::new(());
@@ -81,7 +81,12 @@ pub fn play(scenario: Scenario, dry_run: bool) -> io::Result<()> {
 }
 
 pub fn validate_playback(scenario: &Scenario) -> io::Result<()> {
-    validate(scenario, Desktop::current()?)
+    validate(scenario, Some(Desktop::current()?))
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn validate_scenario(scenario: &Scenario) -> io::Result<()> {
+    validate(scenario, None)
 }
 
 pub fn play_with_updates(
@@ -111,7 +116,7 @@ pub(crate) fn play_with_target(
         .try_lock()
         .map_err(|_| io::Error::other("Адаптер Windows уже занят или завершился с ошибкой"))?;
     let desktop = Desktop::current()?;
-    validate(&scenario, desktop)?;
+    validate(&scenario, Some(desktop))?;
     if cancelled.load(Ordering::Relaxed) {
         return Ok(PlaybackOutcome::Stopped);
     }
@@ -223,7 +228,7 @@ pub fn enable_dpi_awareness() -> io::Result<()> {
     Ok(())
 }
 
-fn validate(scenario: &Scenario, desktop: Desktop) -> io::Result<()> {
+fn validate(scenario: &Scenario, desktop: Option<Desktop>) -> io::Result<()> {
     scenario.validate_motion()?;
     let scenario = scenario.expand_recorded()?;
     let mut duration = Duration::ZERO;
@@ -268,16 +273,25 @@ impl Desktop {
     }
 
     fn convert(self, event: &Event) -> io::Result<Inputs> {
+        Self::event_inputs(Some(self), event)
+    }
+
+    fn event_inputs(desktop: Option<Self>, event: &Event) -> io::Result<Inputs> {
         let (first, second) = match event {
-            Event::MouseMove { x, y } | Event::MouseMoveSmooth { x, y, .. } => (
-                mouse(
-                    normalize(*x, self.x, self.width)?,
-                    normalize(*y, self.y, self.height)?,
-                    0,
-                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                ),
-                None,
-            ),
+            Event::MouseMove { x, y } | Event::MouseMoveSmooth { x, y, .. } => {
+                let Some(desktop) = desktop else {
+                    return Ok(Inputs::new(None, None));
+                };
+                (
+                    mouse(
+                        normalize(*x, desktop.x, desktop.width)?,
+                        normalize(*y, desktop.y, desktop.height)?,
+                        0,
+                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    ),
+                    None,
+                )
+            }
             Event::MouseDown { button }
             | Event::MouseUp { button }
             | Event::MouseHold { button, .. } => {
@@ -494,18 +508,18 @@ fn keyboard_code(key: &str) -> io::Result<(u16, u32)> {
 
 #[cfg(feature = "gui")]
 pub(crate) fn validate_event(coordinates: CoordinateSpace, event: &Event) -> io::Result<()> {
-    validate_in_space(Desktop::current()?, coordinates, event)
+    validate_in_space(None, coordinates, event)
 }
 
 fn validate_in_space(
-    desktop: Desktop,
+    desktop: Option<Desktop>,
     coordinates: CoordinateSpace,
     event: &Event,
 ) -> io::Result<()> {
     if let (CoordinateSpace::Window, Some((x, y))) = (coordinates, event.pointer_position()) {
         return coordinates.validate_point(x, y).map_err(invalid);
     }
-    desktop.convert(event).map(|_| ())
+    Desktop::event_inputs(desktop, event).map(|_| ())
 }
 
 fn mouse(dx: i32, dy: i32, data: u32, flags: u32) -> INPUT {
@@ -752,6 +766,24 @@ mod tests {
     }
 
     #[test]
+    fn desktop_coordinates_are_only_checked_against_a_supplied_desktop() {
+        let point = Event::MouseMove {
+            x: DESKTOP.x + DESKTOP.width,
+            y: DESKTOP.y,
+        };
+        assert!(validate_in_space(None, CoordinateSpace::Desktop, &point).is_ok());
+        assert!(validate_in_space(Some(DESKTOP), CoordinateSpace::Desktop, &point).is_err());
+        assert!(validate_in_space(
+            None,
+            CoordinateSpace::Desktop,
+            &Event::KeyDown {
+                key: "UnknownKey".into()
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
     fn validation_rejects_unsupported_late_event() {
         let scenario = Scenario {
             coordinates: Default::default(),
@@ -768,7 +800,7 @@ mod tests {
                 },
             ],
         };
-        assert!(validate(&scenario, DESKTOP)
+        assert!(validate(&scenario, Some(DESKTOP))
             .unwrap_err()
             .to_string()
             .starts_with("Событие 2:"));

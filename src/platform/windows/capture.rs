@@ -1,7 +1,10 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::mpsc::{self, SyncSender};
+use std::sync::OnceLock;
 use std::thread;
+
+use windows_sys::Win32::Foundation::RECT;
 
 use super::target::{ClientArea, PlaybackTarget};
 use super::*;
@@ -48,17 +51,23 @@ pub enum RecordingUpdate {
     Recording,
 }
 
+pub(crate) struct RecordingStopClick {
+    pub(crate) area: RECT,
+    pub(crate) at: Instant,
+}
+
 pub fn record_with_updates(
     cancelled: &AtomicBool,
     report: impl FnMut(RecordingUpdate) + Send,
 ) -> io::Result<Option<Scenario>> {
-    record_with_target(cancelled, None, None, report)
+    record_with_target(cancelled, None, None, &OnceLock::new(), report)
 }
 
 pub(crate) fn record_with_target(
     cancelled: &AtomicBool,
     shortcut: Option<Chord>,
     target: Option<PlaybackTarget>,
+    stop_click: &OnceLock<RecordingStopClick>,
     mut report: impl FnMut(RecordingUpdate) + Send,
 ) -> io::Result<Option<Scenario>> {
     if cancelled.load(Ordering::Relaxed) {
@@ -75,27 +84,32 @@ pub(crate) fn record_with_target(
             .spawn_scoped(scope, move || {
                 capture(sender, cancelled, shortcut, target, &mut report)
             })?;
-        let scenario = collect(receiver);
+        let scenario = collect(receiver, stop_click);
         worker
             .join()
             .map_err(|_| io::Error::other("Поток перехвата завершился с ошибкой"))??;
         Ok(scenario)
     })?;
     if let Some(scenario) = &scenario {
-        validate(scenario, desktop)?;
+        validate(scenario, Some(desktop))?;
     }
     Ok(scenario)
 }
 
-fn collect(receiver: mpsc::Receiver<Packet>) -> Option<Scenario> {
+fn collect(
+    receiver: mpsc::Receiver<Packet>,
+    stop_click: &OnceLock<RecordingStopClick>,
+) -> Option<Scenario> {
     let mut recorder = None;
     let mut coordinates = CoordinateSpace::Desktop;
     let mut wheel = Wheel::default();
     let mut stop_modifiers = None;
+    let mut started_at = None;
     for packet in receiver {
         match packet {
             Packet::Started(at, space) => {
                 recorder = Some(Recorder::new(at));
+                started_at = Some(at);
                 coordinates = space;
             }
             Packet::Keyboard(at, message, input) => {
@@ -124,10 +138,53 @@ fn collect(receiver: mpsc::Receiver<Packet>) -> Option<Scenario> {
         scenario.coordinates = coordinates;
         if let Some(modifiers) = stop_modifiers {
             remove_stop_modifiers(&mut scenario, modifiers);
+        } else if let (CoordinateSpace::Desktop, Some(start), Some(click)) =
+            (coordinates, started_at, stop_click.get())
+        {
+            remove_stop_click(&mut scenario, start, click);
         }
         crate::core::timeline::compact(&mut scenario);
         scenario
     })
+}
+
+fn remove_stop_click(scenario: &mut Scenario, start: Instant, click: &RecordingStopClick) {
+    let in_button = |(x, y)| {
+        (click.area.left..click.area.right).contains(&x)
+            && (click.area.top..click.area.bottom).contains(&y)
+    };
+    let stop_micros = click.at.saturating_duration_since(start).as_micros();
+    let mut elapsed = 0;
+    let mut position = None;
+    let mut down = None;
+    let mut stop = None;
+    for (index, timed) in scenario.events.iter().enumerate() {
+        elapsed += u128::from(timed.delay_micros);
+        match timed.event {
+            Event::MouseMove { x, y } => position = Some((x, y)),
+            Event::MouseDown {
+                button: MouseButton::Left,
+            } => down = position.filter(|&point| in_button(point)).map(|_| index),
+            Event::MouseUp {
+                button: MouseButton::Left,
+            } => {
+                // shortcut: GUI должен обработать клик за секунду, иначе нужен идентификатор сообщения Win32.
+                let recent = stop_micros
+                    .checked_sub(elapsed)
+                    .is_some_and(|age| age <= 1_000_000);
+                if let Some(down) = down
+                    .take()
+                    .filter(|_| recent && position.is_some_and(in_button))
+                {
+                    stop = Some((down, index));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((down, up)) = stop {
+        scenario.remove_events(&BTreeSet::from([down, up]));
+    }
 }
 
 fn capture(
@@ -488,7 +545,7 @@ mod tests {
                 .unwrap();
         }
         drop(sender);
-        let scenario = collect(receiver).unwrap();
+        let scenario = collect(receiver, &OnceLock::new()).unwrap();
         let events = &scenario.events;
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].delay_micros, 700);
@@ -576,7 +633,7 @@ mod tests {
             .send(Packet::StopShortcut(MOD_WIN | MOD_SHIFT))
             .unwrap();
         drop(sender);
-        let keys: Vec<_> = collect(receiver)
+        let keys: Vec<_> = collect(receiver, &OnceLock::new())
             .unwrap()
             .events
             .into_iter()
@@ -636,6 +693,94 @@ mod tests {
     }
 
     #[test]
+    fn desktop_recording_removes_only_the_click_that_stopped_it() {
+        let (sender, receiver) = mpsc::channel();
+        let start = Instant::now();
+        sender
+            .send(Packet::Started(start, CoordinateSpace::Desktop))
+            .unwrap();
+        for (index, message) in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDOWN, WM_LBUTTONUP]
+            .into_iter()
+            .enumerate()
+        {
+            sender
+                .send(Packet::Mouse(
+                    start + Duration::from_millis((index as u64 + 1) * 10),
+                    message,
+                    MSLLHOOKSTRUCT {
+                        pt: windows_sys::Win32::Foundation::POINT {
+                            x: 50 + index as i32,
+                            y: 80,
+                        },
+                        ..Default::default()
+                    },
+                ))
+                .unwrap();
+        }
+        drop(sender);
+        let stop_click = OnceLock::from(RecordingStopClick {
+            area: RECT {
+                left: 45,
+                top: 75,
+                right: 55,
+                bottom: 85,
+            },
+            at: start + Duration::from_millis(45),
+        });
+        let scenario = collect(receiver, &stop_click).unwrap();
+        let actual = scenario.expand_recorded().unwrap();
+        let mut elapsed = 0;
+        let buttons: Vec<_> = actual
+            .events
+            .into_iter()
+            .filter_map(|timed| {
+                elapsed += timed.delay_micros;
+                matches!(timed.event, Event::MouseDown { .. } | Event::MouseUp { .. })
+                    .then_some(elapsed)
+            })
+            .collect();
+        assert_eq!(buttons, [10_000, 20_000]);
+    }
+
+    #[test]
+    fn stop_click_filter_keeps_an_old_click_in_the_same_area() {
+        let start = Instant::now();
+        let mut recorder = Recorder::new(start);
+        for (delay, event) in [
+            (
+                10,
+                Event::MouseDown {
+                    button: MouseButton::Left,
+                },
+            ),
+            (
+                20,
+                Event::MouseUp {
+                    button: MouseButton::Left,
+                },
+            ),
+        ] {
+            recorder.push_mouse_action(start + Duration::from_millis(delay), (50, 80), event);
+        }
+        let mut scenario = recorder.finish();
+        let original = scenario.clone();
+        remove_stop_click(
+            &mut scenario,
+            start,
+            &RecordingStopClick {
+                area: RECT {
+                    left: 45,
+                    top: 75,
+                    right: 55,
+                    bottom: 85,
+                },
+                at: start + Duration::from_secs(2),
+            },
+        );
+        assert_eq!(scenario, original);
+    }
+
+    #[test]
     fn collecting_closed_input_retains_recorded_events() {
         let (sender, receiver) = mpsc::channel();
         let start = Instant::now();
@@ -653,7 +798,7 @@ mod tests {
             ))
             .unwrap();
         drop(sender);
-        let scenario = collect(receiver).unwrap();
+        let scenario = collect(receiver, &OnceLock::new()).unwrap();
         assert_eq!(scenario.events.len(), 1);
         assert_eq!(scenario.events[0].delay_micros, 20_000);
         assert_eq!(scenario.events[0].event, Event::KeyDown { key: "A".into() });

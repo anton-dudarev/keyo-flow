@@ -6,11 +6,13 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, FontData, FontDefinitions, FontFamily, RichText, Theme};
+use windows_sys::Win32::Foundation::{POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetSaveFileNameW, OFN_EXPLORER, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
     OPENFILENAMEW,
@@ -27,7 +29,8 @@ use crate::platform::windows::hotkeys::{
 };
 use crate::platform::windows::target::{open_windows, pick_window, OpenWindow};
 use crate::platform::windows::{
-    play_with_target, record_with_target, validate_playback, PlaybackUpdate, RecordingUpdate,
+    play_with_target, record_with_target, validate_scenario, PlaybackUpdate, RecordingStopClick,
+    RecordingUpdate,
 };
 use crate::storage::{read_json, write_json_new, write_json_replace};
 
@@ -210,6 +213,7 @@ struct MainWindow {
     status: Status,
     closing: bool,
     pending_recording: Option<Arc<Scenario>>,
+    recording_stop_click: Arc<OnceLock<RecordingStopClick>>,
     dialog_owner: isize,
     playback: PlaybackSettings,
     playback_overlay: Option<overlay::Overlay>,
@@ -435,13 +439,16 @@ impl MainWindow {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let shortcut = self.hotkey_settings.recording_shortcut();
+        let stop_click = Arc::new(OnceLock::new());
+        self.recording_stop_click = Arc::clone(&stop_click);
         self.start_job(context, Some(stop), true, Status::Preparing, move |send| {
-            let result = record_with_target(&worker_stop, shortcut, target, |update| {
-                send(Message::Progress(match update {
-                    RecordingUpdate::Countdown(seconds) => Status::Countdown(seconds),
-                    RecordingUpdate::Recording => Status::Recording,
-                }));
-            });
+            let result =
+                record_with_target(&worker_stop, shortcut, target, &stop_click, |update| {
+                    send(Message::Progress(match update {
+                        RecordingUpdate::Countdown(seconds) => Status::Countdown(seconds),
+                        RecordingUpdate::Recording => Status::Recording,
+                    }));
+                });
             send(Message::Recorded(result));
         });
     }
@@ -466,7 +473,7 @@ impl MainWindow {
         let edited = self.editor.as_ref().map(|editor| editor.scenario.clone());
         self.start_job(context, None, false, Status::Saving, move |send| {
             let scenario = edited.map_or(scenario, Arc::new);
-            let result = validate_playback(&scenario).and_then(|()| {
+            let result = validate_scenario(&scenario).and_then(|()| {
                 let saved = if confirm_overwrite {
                     save_to_path(&path, &scenario, |path| confirm_replace(owner, path))?
                 } else {
@@ -517,7 +524,7 @@ impl MainWindow {
         self.start_job(context, None, false, Status::Saving, move |send| {
             let result = select_save_json(owner).and_then(|path| {
                 let Some(path) = path else { return Ok(None) };
-                validate_playback(&scenario)?;
+                validate_scenario(&scenario)?;
                 let saved = save_to_path(&path, &scenario, |path| confirm_replace(owner, path))?;
                 Ok(saved.then(|| Loaded::new(path, scenario)))
             });
@@ -576,6 +583,27 @@ impl MainWindow {
             stop.store(true, Ordering::Relaxed);
             self.status = Status::Stopping;
         }
+    }
+
+    fn stop_from_button(&mut self, response: &egui::Response) {
+        if self.recording_active() && response.clicked_by(egui::PointerButton::Primary) {
+            let mut origin = POINT::default();
+            // SAFETY: активное окно принадлежит потоку GUI, POINT доступен для записи.
+            if unsafe { ClientToScreen(GetActiveWindow(), &mut origin) } != 0 {
+                let scale = response.ctx.pixels_per_point();
+                let rect = response.interact_rect;
+                let _ = self.recording_stop_click.set(RecordingStopClick {
+                    area: RECT {
+                        left: origin.x + (rect.left() * scale).floor() as i32,
+                        top: origin.y + (rect.top() * scale).floor() as i32,
+                        right: origin.x + (rect.right() * scale).ceil() as i32,
+                        bottom: origin.y + (rect.bottom() * scale).ceil() as i32,
+                    },
+                    at: Instant::now(),
+                });
+            }
+        }
+        self.stop();
     }
 
     fn poll_messages(&mut self) {
@@ -871,9 +899,10 @@ impl MainWindow {
                     };
                     let enabled =
                         (active && !matches!(self.status, Status::Stopping)) || self.can_play();
-                    if action_button(ui, enabled, icon, label, fill, button_text, 140.0).clicked() {
+                    let button = action_button(ui, enabled, icon, label, fill, button_text, 140.0);
+                    if button.clicked() {
                         if active {
-                            self.stop();
+                            self.stop_from_button(&button);
                         } else {
                             self.play(&context);
                         }
@@ -1385,7 +1414,7 @@ fn load_selected(owner: isize, last_directory: Option<&Path>) -> io::Result<Opti
 
 fn load_path(path: PathBuf) -> io::Result<Loaded> {
     let scenario = read_json(BufReader::new(File::open(&path)?))?;
-    validate_playback(&scenario)?;
+    validate_scenario(&scenario)?;
     Ok(Loaded::new(path, Arc::new(scenario)))
 }
 
@@ -2036,6 +2065,29 @@ mod tests {
             Status::Finished(PlaybackOutcome::Stopped)
         ));
         assert!(!window.input_active());
+    }
+
+    #[test]
+    fn gui_opens_and_saves_scenarios_from_a_different_desktop() {
+        let path = std::env::temp_dir().join(format!("keyo-desktop-{}.json", std::process::id()));
+        let scenario = read_json(
+            br#"{"version":2,"events":[
+                {"delay_micros":0,"event":{"type":"mouse_move","x":2147483647,"y":0}}
+            ]}"#
+            .as_slice(),
+        )
+        .unwrap();
+        write_json_replace(&path, &scenario).unwrap();
+        let loaded = load_path(path.clone());
+        fs::remove_file(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(*loaded.scenario, scenario);
+
+        validate_scenario(&loaded.scenario).unwrap();
+        assert!(save_to_path(&path, &loaded.scenario, |_| false).unwrap());
+        let reopened = load_path(path.clone());
+        fs::remove_file(path).unwrap();
+        assert_eq!(*reopened.unwrap().scenario, scenario);
     }
 
     #[test]
