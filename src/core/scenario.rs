@@ -1,5 +1,6 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU8};
 
 use serde::{Deserialize, Serialize};
 
@@ -123,6 +124,60 @@ pub struct MousePoint {
     pub y: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScanCode {
+    pub code: NonZeroU8,
+    #[serde(default)]
+    pub extended: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyboardKey {
+    #[serde(rename = "key")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_code: Option<ScanCode>,
+}
+
+impl From<String> for KeyboardKey {
+    fn from(name: String) -> Self {
+        Self {
+            name,
+            scan_code: None,
+        }
+    }
+}
+
+impl From<&str> for KeyboardKey {
+    fn from(name: &str) -> Self {
+        name.to_owned().into()
+    }
+}
+
+impl KeyboardKey {
+    pub(super) fn identity(&self) -> KeyIdentity<'_> {
+        match self.scan_code {
+            Some(scan) => KeyIdentity::Physical(scan),
+            None => KeyIdentity::Named(Cow::Borrowed(&self.name)),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub(super) enum KeyIdentity<'a> {
+    Physical(ScanCode),
+    Named(Cow<'a, str>),
+}
+
+impl KeyIdentity<'_> {
+    pub(super) fn into_owned(self) -> KeyIdentity<'static> {
+        match self {
+            Self::Physical(scan) => KeyIdentity::Physical(scan),
+            Self::Named(name) => KeyIdentity::Named(Cow::Owned(name.into_owned())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -155,20 +210,24 @@ pub enum Event {
         x: i64,
         y: i64,
     },
-    /// Key identifier shared by the recording and playback adapters.
+    /// Имя клавиши и необязательный код физического нажатия.
     KeyDown {
-        key: String,
+        #[serde(flatten)]
+        key: KeyboardKey,
     },
     KeyUp {
-        key: String,
+        #[serde(flatten)]
+        key: KeyboardKey,
     },
     KeyHold {
-        key: String,
+        #[serde(flatten)]
+        key: KeyboardKey,
         duration_micros: u64,
     },
     /// Удержание на временной шкале. Следующая задержка отсчитывается от его начала.
     KeySpan {
-        key: String,
+        #[serde(flatten)]
+        key: KeyboardKey,
         duration_micros: u64,
         #[serde(default)]
         release_order: u64,

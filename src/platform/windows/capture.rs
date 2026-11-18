@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::num::NonZeroU8;
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::OnceLock;
 use std::thread;
@@ -9,6 +10,7 @@ use windows_sys::Win32::Foundation::RECT;
 use super::target::{ClientArea, PlaybackTarget};
 use super::*;
 use crate::core::recorder::Recorder;
+use crate::core::scenario::{KeyboardKey, ScanCode};
 
 thread_local! {
     static SINK: RefCell<Option<CaptureSink>> = const { RefCell::new(None) };
@@ -366,7 +368,7 @@ fn remove_stop_modifiers(scenario: &mut Scenario, modifiers: u32) {
         match &timed.event {
             Event::MouseMove { .. } => {}
             Event::KeyDown { key }
-                if keyboard_code(key).is_ok_and(|(code, _)| {
+                if keyboard_code(&key.name).is_ok_and(|(code, _)| {
                     MODIFIER_KEYS
                         .iter()
                         .any(|&(modifier, flag)| modifier == code && modifiers & flag != 0)
@@ -443,7 +445,7 @@ fn capture_key_code(input: KBDLLHOOKSTRUCT) -> Option<u16> {
 fn keyboard_event(message: u32, input: KBDLLHOOKSTRUCT) -> Option<Event> {
     let extended = input.flags & LLKHF_EXTENDED != 0;
     let code = capture_key_code(input)?;
-    let key = match u8::try_from(code).ok()? {
+    let name = match u8::try_from(code).ok()? {
         character @ (b'A'..=b'Z' | b'0'..=b'9') => char::from(character).to_string(),
         _ if code == VK_RETURN && extended => "NumpadEnter".into(),
         _ => NAMED_KEYS
@@ -452,6 +454,16 @@ fn keyboard_event(message: u32, input: KBDLLHOOKSTRUCT) -> Option<Event> {
             .0
             .into(),
     };
+    // Pause использует последовательность E1, которую SendInput не принимает как обычный скан-код.
+    let scan_code = if code == VK_PAUSE {
+        None
+    } else {
+        u8::try_from(input.scanCode)
+            .ok()
+            .and_then(NonZeroU8::new)
+            .map(|code| ScanCode { code, extended })
+    };
+    let key = KeyboardKey { name, scan_code };
     match message {
         WM_KEYDOWN | WM_SYSKEYDOWN => Some(Event::KeyDown { key }),
         WM_KEYUP | WM_SYSKEYUP => Some(Event::KeyUp { key }),
@@ -525,13 +537,13 @@ mod tests {
         sender
             .send(Packet::Started(start, CoordinateSpace::Desktop))
             .unwrap();
-        for (micros, message, code) in [
-            (700, WM_KEYDOWN, u32::from(b'A')),
-            (50_825, WM_KEYUP, u32::from(b'A')),
-            (51_000, WM_KEYDOWN, u32::from(VK_LCONTROL)),
-            (52_000, WM_KEYDOWN, u32::from(b'C')),
-            (53_000, WM_KEYUP, u32::from(b'C')),
-            (54_000, WM_KEYUP, u32::from(VK_LCONTROL)),
+        for (micros, message, code, scan_code) in [
+            (700, WM_KEYDOWN, u32::from(b'A'), 0x1e),
+            (50_825, WM_KEYUP, u32::from(b'A'), 0x1e),
+            (51_000, WM_KEYDOWN, u32::from(VK_LCONTROL), 0x1d),
+            (52_000, WM_KEYDOWN, u32::from(b'C'), 0x2e),
+            (53_000, WM_KEYUP, u32::from(b'C'), 0x2e),
+            (54_000, WM_KEYUP, u32::from(VK_LCONTROL), 0x1d),
         ] {
             sender
                 .send(Packet::Keyboard(
@@ -539,6 +551,7 @@ mod tests {
                     message,
                     KBDLLHOOKSTRUCT {
                         vkCode: code,
+                        scanCode: scan_code,
                         ..Default::default()
                     },
                 ))
@@ -546,13 +559,20 @@ mod tests {
         }
         drop(sender);
         let scenario = collect(receiver, &OnceLock::new()).unwrap();
+        let physical = |name: &str, code| KeyboardKey {
+            name: name.into(),
+            scan_code: Some(ScanCode {
+                code: NonZeroU8::new(code).unwrap(),
+                extended: false,
+            }),
+        };
         let events = &scenario.events;
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].delay_micros, 700);
         assert_eq!(
             events[0].event,
             Event::KeySpan {
-                key: "A".into(),
+                key: physical("A", 0x1e),
                 duration_micros: 50_125,
                 release_order: 0,
             }
@@ -561,7 +581,7 @@ mod tests {
         assert_eq!(
             events[1].event,
             Event::KeySpan {
-                key: "ControlLeft".into(),
+                key: physical("ControlLeft", 0x1d),
                 duration_micros: 3000,
                 release_order: 0,
             }
@@ -569,7 +589,7 @@ mod tests {
         assert_eq!(
             events[2].event,
             Event::KeySpan {
-                key: "C".into(),
+                key: physical("C", 0x2e),
                 duration_micros: 1000,
                 release_order: 0,
             }
@@ -832,13 +852,21 @@ mod tests {
         );
         let control = KBDLLHOOKSTRUCT {
             vkCode: u32::from(VK_CONTROL),
+            scanCode: 0x1d,
             flags: LLKHF_EXTENDED,
             ..Default::default()
         };
         let Some(Event::KeyUp { key }) = keyboard_event(WM_KEYUP, control) else {
             panic!("Ожидалось отпускание правого Ctrl");
         };
-        assert_eq!(keyboard_code(&key).unwrap().0, VK_RCONTROL);
+        assert_eq!(keyboard_code(&key.name).unwrap().0, VK_RCONTROL);
+        assert_eq!(
+            key.scan_code,
+            Some(ScanCode {
+                code: NonZeroU8::new(0x1d).unwrap(),
+                extended: true,
+            })
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 mod tests {
     use super::*;
     use crate::core::player::{play_with_options, PlaybackOptions, PlaybackOutcome, RepeatMode};
-    use crate::core::scenario::{Event, Scenario, TimedEvent};
+    use crate::core::scenario::{Event, KeyboardKey, Scenario, TimedEvent};
     use std::sync::mpsc;
 
     #[test]
@@ -33,7 +33,7 @@ mod tests {
 
     #[test]
     fn corner_signal_stops_an_unlimited_run_during_a_long_delay() {
-        let key = String::from("ControlLeft");
+        let key = KeyboardKey::from("ControlLeft");
         let (sender, events) = mpsc::channel();
         let scenario = Scenario {
             coordinates: Default::default(),

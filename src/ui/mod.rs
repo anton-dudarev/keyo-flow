@@ -856,7 +856,7 @@ impl MainWindow {
                             self.save_recording(&context);
                         }
                         if ui
-                            .add_enabled(self.job.is_none(), egui::Button::new("Отбросить запись"))
+                            .add_enabled(self.job.is_none(), egui::Button::new("Отменить запись"))
                             .clicked()
                         {
                             self.pending_recording = None;
@@ -1507,7 +1507,6 @@ mod tests {
             },
             ..Default::default()
         };
-        window.hotkey_settings.show_playback_indicator = true;
         for (number, expected) in [(1, "0/1000"), (123, "122/1000")] {
             window.status = Status::Playing(PlaybackPass {
                 number,
@@ -1535,8 +1534,6 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(window.playback_indicator().is_none());
-        window.hotkey_settings.show_playback_indicator = true;
         let labels = window.playback_indicator().unwrap();
         assert_eq!(labels.title, "Запуск 2 из 3");
         assert_eq!(labels.detail, None);
@@ -1544,6 +1541,9 @@ mod tests {
         let labels = window.playback_indicator().unwrap();
         assert_eq!(labels.title, "Запуск 2");
         assert_eq!(labels.detail.as_deref(), Some("без лимита"));
+        window.hotkey_settings.show_playback_indicator = false;
+        assert!(window.playback_indicator().is_none());
+        window.hotkey_settings.show_playback_indicator = true;
         for status in [
             Status::Countdown(1),
             Status::Recording,

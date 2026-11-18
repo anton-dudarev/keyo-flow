@@ -1,6 +1,6 @@
 [package]
 name = "keyo-flow"
-version = "0.25.2"
+version = "0.26.0"
 edition = "2021"
 default-run = "keyo-cli"
 

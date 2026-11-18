@@ -18,6 +18,15 @@ mod tests {
     }
 
     #[test]
+    fn playback_indicator_defaults_to_enabled_and_respects_saved_opt_out() {
+        let legacy: HotkeySettings = serde_json::from_str("{}").unwrap();
+        let disabled: HotkeySettings =
+            serde_json::from_str(r#"{"show_playback_indicator":false}"#).unwrap();
+        assert!(legacy.show_playback_indicator);
+        assert!(!disabled.show_playback_indicator);
+    }
+
+    #[test]
     fn validates_win_combinations_and_rejects_duplicates() {
         let record = Shortcut {
             win: true,
@@ -84,7 +93,7 @@ impl Default for HotkeySettings {
         Self {
             record: shortcut("R"),
             play: shortcut("P"),
-            show_playback_indicator: false,
+            show_playback_indicator: true,
             timing_variation: Default::default(),
         }
     }

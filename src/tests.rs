@@ -1,5 +1,24 @@
-use crate::core::scenario::{Event, MouseButton, Scenario, TimedEvent};
+use crate::core::scenario::{Event, KeyboardKey, MouseButton, Scenario, TimedEvent};
 use crate::storage::{read_json, write_json};
+
+#[test]
+fn keyboard_events_keep_the_legacy_key_field_and_round_trip_optional_scan_codes() {
+    for version in [2, 3] {
+        let value = serde_json::json!({"version":version,"events":[
+            {"delay_micros":0,"event":{"type":"key_down","key":"F"}},
+            {"delay_micros":1,"event":{"type":"key_up","key":"F","scan_code":{"code":33,"extended":false}}}
+        ]});
+        let scenario = read_json(value.to_string().as_bytes()).unwrap();
+        let mut output = Vec::new();
+        write_json(&mut output, &scenario).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+            value
+        );
+    }
+    let invalid = br#"{"version":2,"events":[{"delay_micros":0,"event":{"type":"key_down","key":"F","scan_code":{"code":0}}}]}"#;
+    assert!(read_json(invalid.as_slice()).is_err());
+}
 
 #[test]
 fn smooth_move_round_trips_as_one_event_and_preserves_time_when_deleted() {
@@ -207,7 +226,7 @@ mod playback {
 
     #[test]
     fn stop_skips_pending_event_and_releases_modifier_before_reporting() {
-        let key = String::from("ControlLeft");
+        let key = KeyboardKey::from("ControlLeft");
         let down = Event::KeyDown { key: key.clone() };
         let (sent, received) = mpsc::channel();
         let player = play(
@@ -238,7 +257,7 @@ mod playback {
 
     #[test]
     fn stop_releases_held_key_and_mouse_button_in_reverse_order() {
-        let key = String::from("A");
+        let key = KeyboardKey::from("A");
         let button = MouseButton::Left;
         let down = Event::KeyDown { key: key.clone() };
         let mouse_down = Event::MouseDown { button };
@@ -272,7 +291,7 @@ mod playback {
 
     #[test]
     fn send_error_releases_modifier_before_reporting() {
-        let key = String::from("ShiftRight");
+        let key = KeyboardKey::from("ShiftRight");
         let down = Event::KeyDown { key: key.clone() };
         let (sent, received) = mpsc::channel();
         let player = play(

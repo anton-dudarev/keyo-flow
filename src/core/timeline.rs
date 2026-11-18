@@ -58,15 +58,17 @@ pub(crate) fn compact(scenario: &mut Scenario) {
                     continue;
                 }
             }
-            Event::KeyDown { key } if !pending.contains_key(key) => {
-                pending.insert(key.clone(), (rows.len(), at));
+            Event::KeyDown { key } => {
+                pending
+                    .entry(key.identity().into_owned())
+                    .or_insert_with(|| (rows.len(), at, key.clone()));
             }
             Event::KeyUp { key } => {
-                if let Some((index, began)) = pending.remove(key) {
+                if let Some((index, began, key)) = pending.remove(&key.identity().into_owned()) {
                     rows[index] = (
                         began,
                         Event::KeySpan {
-                            key: key.clone(),
+                            key,
                             duration_micros: (at - began) as u64,
                             release_order: order,
                         },
@@ -427,7 +429,7 @@ mod tests {
         scenario.merge_hold(0, 2).unwrap();
         assert_eq!(scenario.events.len(), 3);
         assert!(
-            matches!(&scenario.events[0].event, Event::KeySpan { key, duration_micros: 400, .. } if key == "D")
+            matches!(&scenario.events[0].event, Event::KeySpan { key, duration_micros: 400, .. } if key.name == "D")
         );
         assert_eq!(scenario.expand_recorded().unwrap(), expected);
     }

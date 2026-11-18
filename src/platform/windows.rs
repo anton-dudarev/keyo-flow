@@ -322,7 +322,20 @@ impl Desktop {
             | Event::KeyUp { key }
             | Event::KeyHold { key, .. }
             | Event::KeySpan { key, .. } => {
-                let (code, mut flags) = keyboard_code(key)?;
+                let (code, flags) = keyboard_code(&key.name)?;
+                let (virtual_key, scan_code, mut flags) = match key.scan_code {
+                    Some(scan) => (
+                        0,
+                        u16::from(scan.code.get()),
+                        KEYEVENTF_SCANCODE
+                            | if scan.extended {
+                                KEYEVENTF_EXTENDEDKEY
+                            } else {
+                                0
+                            },
+                    ),
+                    None => (code, 0, flags),
+                };
                 if matches!(event, Event::KeyUp { .. }) {
                     flags |= KEYEVENTF_KEYUP;
                 }
@@ -331,7 +344,8 @@ impl Desktop {
                         r#type: INPUT_KEYBOARD,
                         Anonymous: INPUT_0 {
                             ki: KEYBDINPUT {
-                                wVk: code,
+                                wVk: virtual_key,
+                                wScan: scan_code,
                                 dwFlags: flags,
                                 ..Default::default()
                             },
@@ -763,6 +777,26 @@ mod tests {
         let key = unsafe { inputs.values[0].Anonymous.ki };
         assert_eq!(key.wVk, VK_RCONTROL);
         assert_eq!(key.dwFlags, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP);
+    }
+
+    #[test]
+    fn recorded_key_uses_the_scan_code_from_json() {
+        let scenario = crate::storage::read_json(
+            br#"{"version":2,"events":[{"delay_micros":0,"event":{
+                "type":"key_up","key":"NumpadEnter","scan_code":{"code":28,"extended":true}
+            }}]}"#
+                .as_slice(),
+        )
+        .unwrap();
+        let inputs = DESKTOP.convert(&scenario.events[0].event).unwrap();
+        // SAFETY: событие клавиатуры инициализирует поле ki.
+        let key = unsafe { inputs.values[0].Anonymous.ki };
+        assert_eq!(key.wVk, 0);
+        assert_eq!(key.wScan, 28);
+        assert_eq!(
+            key.dwFlags,
+            KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use super::scenario::{Event, MouseButton, Scenario, TimedEvent};
+use super::scenario::{Event, KeyIdentity, MouseButton, Scenario, TimedEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,7 +25,7 @@ impl Default for TimingVariation {
 
 #[derive(PartialEq, Eq, Hash)]
 enum Pressed<'a> {
-    Key(&'a str),
+    Key(KeyIdentity<'a>),
     Mouse(MouseButton),
 }
 
@@ -64,13 +64,13 @@ impl TimingVariation {
             let mut released = None;
             match &timed.event {
                 Event::KeyDown { key } => {
-                    pressed.entry(Pressed::Key(key)).or_insert(index);
+                    pressed.entry(Pressed::Key(key.identity())).or_insert(index);
                 }
                 Event::MouseDown { button } => {
                     pressed.entry(Pressed::Mouse(*button)).or_insert(index);
                 }
                 Event::KeyUp { key } => {
-                    if let Some(down) = pressed.remove(&Pressed::Key(key)) {
+                    if let Some(down) = pressed.remove(&Pressed::Key(key.identity())) {
                         released = Some(down);
                     }
                 }

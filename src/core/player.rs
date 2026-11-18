@@ -234,7 +234,7 @@ fn wait_until(deadline: Instant, stopped: &AtomicBool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::scenario::TimedEvent;
+    use crate::core::scenario::{KeyboardKey, ScanCode, TimedEvent};
     use crate::core::timeline::smooth_steps;
 
     #[test]
@@ -377,7 +377,7 @@ mod tests {
                 let Event::KeyUp { key } = event else {
                     panic!("Ожидалось отпускание")
                 };
-                key
+                key.name
             })
             .collect();
         released.sort();
@@ -387,7 +387,13 @@ mod tests {
     #[test]
     fn stopping_during_key_hold_releases_the_key() {
         let (sender, receiver) = mpsc::channel();
-        let key = String::from("Space");
+        let key = KeyboardKey {
+            name: "Space".into(),
+            scan_code: Some(ScanCode {
+                code: 0x39.try_into().unwrap(),
+                extended: false,
+            }),
+        };
         let playback = play(
             Scenario {
                 coordinates: Default::default(),
@@ -485,7 +491,7 @@ mod tests {
 
     #[test]
     fn losing_target_focus_releases_held_input_without_sending_the_next_event() {
-        let key = String::from("ControlLeft");
+        let key = KeyboardKey::from("ControlLeft");
         let down = Event::KeyDown { key: key.clone() };
         let (sender, receiver) = mpsc::channel();
         let mut checks = 0;
@@ -530,7 +536,7 @@ mod tests {
 
     #[test]
     fn infinite_playback_can_stop_in_the_middle_of_a_delay() {
-        let key = String::from("A");
+        let key = KeyboardKey::from("A");
         let down = Event::KeyDown { key: key.clone() };
         let (sender, receiver) = mpsc::channel();
         let playback = play_with_options(

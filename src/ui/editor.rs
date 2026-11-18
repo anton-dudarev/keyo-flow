@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 
 use eframe::egui::{self, Align, RichText};
 
-use crate::core::scenario::{CoordinateSpace, Event, MouseButton, Scenario, TimedEvent};
+use crate::core::scenario::{
+    CoordinateSpace, Event, KeyboardKey, MouseButton, Scenario, TimedEvent,
+};
 use crate::platform::windows::{key_names, validate_event};
 
 use super::{
@@ -894,6 +896,7 @@ struct PositionFields {
     y: i64,
     button: MouseButton,
     key: String,
+    original_key: Option<KeyboardKey>,
     key_search: String,
     key_picker_open: bool,
     delay: String,
@@ -910,6 +913,7 @@ impl Default for PositionFields {
             y: 0,
             button: MouseButton::Left,
             key: "A".into(),
+            original_key: None,
             key_search: String::new(),
             key_picker_open: false,
             delay: "0".into(),
@@ -975,12 +979,14 @@ impl PositionFields {
                 } else {
                     None
                 };
-                position.key.clone_from(key);
+                position.key.clone_from(&key.name);
+                position.original_key = Some(key.clone());
                 position.hold_duration_ms = format_delay(*duration_micros);
                 ActionKind::KeyHold
             }
             Event::KeyDown { key } | Event::KeyUp { key } => {
-                position.key.clone_from(key);
+                position.key.clone_from(&key.name);
+                position.original_key = Some(key.clone());
                 if matches!(timed.event, Event::KeyDown { .. }) {
                     ActionKind::KeyDown
                 } else {
@@ -1147,10 +1153,15 @@ impl PositionFields {
             },
             ActionKind::KeyHold | ActionKind::KeyDown | ActionKind::KeyUp => {
                 let name = self.key.trim();
-                let key = key_names()
+                let name = key_names()
                     .find(|candidate| candidate.eq_ignore_ascii_case(name))
-                    .unwrap_or(name)
-                    .to_owned();
+                    .unwrap_or(name);
+                let key = self
+                    .original_key
+                    .as_ref()
+                    .filter(|key| key.name == name)
+                    .cloned()
+                    .unwrap_or_else(|| name.into());
                 match self.kind {
                     ActionKind::KeyHold => {
                         let duration_micros = parse_delay(&self.hold_duration_ms)
@@ -1252,8 +1263,8 @@ fn describe(event: &Event) -> String {
             format_delay(*duration_micros)
         ),
         Event::Scroll { x, y } => format!("Прокрутка ({x}, {y})"),
-        Event::KeyDown { key } => format!("Нажатие клавиши {key}"),
-        Event::KeyUp { key } => format!("Отпускание клавиши {key}"),
+        Event::KeyDown { key } => format!("Нажатие клавиши {}", key.name),
+        Event::KeyUp { key } => format!("Отпускание клавиши {}", key.name),
         Event::KeyHold {
             key,
             duration_micros,
@@ -1262,7 +1273,11 @@ fn describe(event: &Event) -> String {
             key,
             duration_micros,
             ..
-        } => format!("Удержание {key} за {} мс", format_delay(*duration_micros)),
+        } => format!(
+            "Удержание {} за {} мс",
+            key.name,
+            format_delay(*duration_micros)
+        ),
     }
 }
 
@@ -1300,7 +1315,7 @@ mod tests {
         assert_eq!(editor.scenario.events.len(), 1);
         assert_eq!(editor.scenario.events[0].delay_micros, 700);
         assert!(
-            matches!(&editor.scenario.events[0].event, Event::KeySpan { key, duration_micros: 50125, .. } if key == "D")
+            matches!(&editor.scenario.events[0].event, Event::KeySpan { key, duration_micros: 50125, .. } if key.name == "D")
         );
         assert_eq!(editor.selection, [0].into());
         assert!(editor.changed);
@@ -1940,6 +1955,45 @@ mod tests {
         assert_eq!(editor.scenario.events, [original, updated]);
         assert_eq!(editor.selected, 1);
         assert!(editor.changed);
+    }
+
+    #[test]
+    fn editing_a_recorded_hold_preserves_its_scan_code_until_the_key_changes() {
+        let event = TimedEvent {
+            delay_micros: 0,
+            event: Event::KeySpan {
+                key: KeyboardKey {
+                    name: "F".into(),
+                    scan_code: Some(crate::core::scenario::ScanCode {
+                        code: 0x21.try_into().unwrap(),
+                        extended: false,
+                    }),
+                },
+                duration_micros: 100_000,
+                release_order: 0,
+            },
+        };
+        let mut editor = Editor::new(Scenario {
+            coordinates: Default::default(),
+            events: vec![event],
+        });
+        editor.begin_edit(0);
+        let position = &mut editor.form.as_mut().unwrap().position;
+        position.delay = "10".into();
+        let edited = position.to_timed_event().unwrap();
+        assert_eq!(edited.delay_micros, 10_000);
+        assert_eq!(edited.event, editor.scenario.events[0].event);
+
+        position.key = "G".into();
+        assert!(matches!(
+            position.to_timed_event().unwrap().event,
+            Event::KeySpan { key, .. } if key == KeyboardKey::from("G")
+        ));
+        editor.apply_position(edited);
+        let original = editor.scenario.expand_recorded().unwrap();
+        editor.split_selected_hold();
+        editor.scenario.merge_hold(0, 1).unwrap();
+        assert_eq!(editor.scenario.expand_recorded().unwrap(), original);
     }
 
     #[test]
