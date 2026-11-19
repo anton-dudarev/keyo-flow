@@ -105,7 +105,7 @@ cargo run --locked --bin keyo-cli -- play scenario.json --dry-run
 
 ## Сборка и проверка
 
-Для сборки GUI нужен Rust 1.95 или новее с Cargo. Выполни в корне репозитория:
+Для сборки GUI нужен Rust 1.95 или новее с Cargo. Для компиляции значка нужен Windows SDK (`rc.exe`) с MSVC или `windres` с GNU. Выполни в корне репозитория:
 
 ```sh
 cargo build --locked --features gui --bins

@@ -51,9 +51,12 @@ pub fn run() -> eframe::Result {
     let windows = WindowSettings::load();
     let hotkey_file = profile_file("hotkeys.json");
     let hotkey_settings = settings::load(hotkey_file.as_deref());
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/keyo.png"))
+        .expect("Не удалось прочитать встроенную иконку Keyo");
     let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
+            .with_icon(icon)
             .with_inner_size(WINDOW_SIZE)
             .with_resizable(false)
             .with_maximize_button(false),
