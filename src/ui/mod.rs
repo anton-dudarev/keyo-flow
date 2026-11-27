@@ -827,7 +827,21 @@ impl MainWindow {
             .loaded
             .as_ref()
             .is_some_and(|loaded| !loaded.scenario.events.is_empty());
-        egui::Frame::new().inner_margin(25).show(ui, |ui| {
+        egui::Panel::bottom("version")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(25, 6)))
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .color(weak),
+                    );
+                });
+            });
+        let mut content_margin = egui::Margin::same(25);
+        content_margin.bottom = 0;
+        egui::Frame::new().inner_margin(content_margin).show(ui, |ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), 36.0),
                 egui::Layout::right_to_left(Align::Center),
@@ -1922,6 +1936,9 @@ mod tests {
                 },
                 ..Default::default()
             };
+            window.recent.paths = (0..10)
+                .map(|index| PathBuf::from(format!("recent-{index}.json")))
+                .collect();
             let mut input = egui::RawInput {
                 screen_rect: Some(rect),
                 ..Default::default()
@@ -1947,6 +1964,17 @@ mod tests {
             };
             let playback = text_bounds(label);
             let record = text_bounds("Записать");
+            let version = text_bounds(concat!("v", env!("CARGO_PKG_VERSION")));
+            assert!(rect.contains_rect(version));
+            assert!(rect.right() - version.right() < 32.0);
+            assert!(rect.bottom() - version.bottom() < 20.0);
+            assert!(text_bounds("Недавние сценарии").bottom() < version.top());
+            assert!(output.shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::epaint::Shape::Text(text)
+                    if text.galley.text() == "recent-0.json"
+                    && clipped.clip_rect.contains_rect(text.visual_bounding_rect())
+                    && clipped.clip_rect.bottom() <= version.top())
+            }));
             assert!(playback.right() < record.left());
             assert!((playback.center().y - record.center().y).abs() < 2.0);
             assert!(output.shapes.iter().any(|clipped| {
