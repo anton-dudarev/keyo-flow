@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "keyo-flow"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "eframe",
  "serde",

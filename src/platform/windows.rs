@@ -95,6 +95,11 @@ pub fn play_with_updates(
     cancelled: &AtomicBool,
     report: impl FnMut(PlaybackUpdate),
 ) -> io::Result<PlaybackOutcome> {
+    if scenario.coordinates == CoordinateSpace::Window {
+        return Err(invalid(
+            "Сценарий использует координаты окна. Запусти его в графическом интерфейсе Keyo",
+        ));
+    }
     play_with_target(scenario, options, cancelled, None, report)
 }
 
@@ -106,12 +111,6 @@ pub(crate) fn play_with_target(
     mut report: impl FnMut(PlaybackUpdate),
 ) -> io::Result<PlaybackOutcome> {
     options.validate(&scenario)?;
-    let window_coordinates = match scenario.coordinates {
-        CoordinateSpace::Desktop => None,
-        CoordinateSpace::Window => Some(target.ok_or_else(|| invalid(
-            "Сценарий использует координаты окна. Выбери целевое окно в графическом интерфейсе Keyo",
-        ))?),
-    };
     let _active = ACTIVE
         .try_lock()
         .map_err(|_| io::Error::other("Адаптер Windows уже занят или завершился с ошибкой"))?;
@@ -136,6 +135,20 @@ pub(crate) fn play_with_target(
         return Ok(PlaybackOutcome::Stopped);
     }
 
+    if let Some(selected) = target {
+        if !selected.activate(stop)? {
+            return Ok(PlaybackOutcome::Stopped);
+        }
+    }
+    let target = target::resolve_playback_target(
+        scenario.coordinates,
+        target,
+        target::PlaybackTarget::foreground,
+    )?;
+    let window_coordinates = target.filter(|_| scenario.coordinates == CoordinateSpace::Window);
+    if stop() {
+        return Ok(PlaybackOutcome::Stopped);
+    }
     let check_target = move || target.map_or(Ok(()), target::PlaybackTarget::check_focus);
     check_target()?;
     let playback = player::play_with_guard(

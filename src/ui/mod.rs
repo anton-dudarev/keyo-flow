@@ -1026,13 +1026,22 @@ impl MainWindow {
                         "Нажми «Стоп», чтобы завершить запись"
                     }
                 } else if matches!(self.status, Status::Countdown(_)) {
-                    "Переключись в целевое окно. Остановка: Esc или верхний левый угол"
+                    if self.playback_target.is_some() {
+                        "Keyo переключится в выбранное окно. Остановка: Esc или верхний левый угол"
+                    } else {
+                        "Запуск в активном окне. Остановка: Esc или верхний левый угол"
+                    }
                 } else {
                     "Остановка: Esc или верхний левый угол основного монитора"
                 };
                 ui.label(RichText::new(hint).color(weak));
             } else if has_events && matches!(self.status, Status::Ready | Status::Saved) {
-                ui.label(RichText::new("После запуска переключись в целевое окно.").color(weak));
+                let hint = if self.playback_target.is_some() {
+                    "Keyo переключится в выбранное окно после отсчёта."
+                } else {
+                    "Сценарий запустится в окне, активном в конце отсчёта."
+                };
+                ui.label(RichText::new(hint).color(weak));
             }
             if let Some(fraction) = self.progress(&context) {
                 ui.add_space(12.0);
